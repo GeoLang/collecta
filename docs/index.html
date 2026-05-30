@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Collecta — Field Data Collection SDK</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--heading:#f0f6fc;--accent:#a78bfa;--accent2:#3fb950;--muted:#8b949e}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;line-height:1.6}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+.container{max-width:900px;margin:0 auto;padding:0 24px}
+header{border-bottom:1px solid var(--border);padding:64px 0 40px;text-align:center;background:linear-gradient(180deg,#1a1030 0%,var(--bg) 100%)}
+header h1{font-size:3rem;font-weight:700;background:linear-gradient(135deg,var(--accent),#06b6d4);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin-bottom:12px}
+header .tagline{font-size:1.2rem;color:var(--muted);max-width:600px;margin:0 auto}
+.badges{margin-top:20px;display:flex;gap:8px;justify-content:center}
+.badges img{height:24px}
+section{padding:48px 0;border-bottom:1px solid var(--border)}
+h2{font-size:1.5rem;color:var(--heading);margin-bottom:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px;margin-top:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:20px}
+.card h3{color:var(--heading);font-size:1rem;margin-bottom:8px}
+.card p{font-size:.9rem;color:var(--muted)}
+table{width:100%;border-collapse:collapse;margin-top:16px;font-size:.9rem}
+th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--border)}
+th{color:var(--accent);font-weight:600}
+code{background:#1a2030;padding:2px 6px;border-radius:4px;font-size:.85rem}
+pre{background:#1a2030;border:1px solid var(--border);border-radius:8px;padding:16px;overflow-x:auto;margin-top:12px}
+footer{padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
+</style>
+</head>
+<body>
+<header>
+<div class="container">
+<h1>📋 Collecta</h1>
+<p class="tagline">Schema-driven field data collection — offline-first mobile forms, validation, attachments, and sync.</p>
+<div class="badges">
+<img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" alt="License">
+<img src="https://img.shields.io/badge/Rust-2024_edition-orange.svg" alt="Rust">
+</div>
+</div>
+</header>
+
+<section>
+<div class="container">
+<h2>Features</h2>
+<div class="grid">
+<div class="card"><h3>📝 Form Schemas</h3><p>20+ field types with conditional logic, validation constraints, and XLSForm-compatible structure.</p></div>
+<div class="card"><h3>📡 Offline-First Sync</h3><p>Queue submissions offline with exponential backoff retry. Never lose field data.</p></div>
+<div class="card"><h3>📎 Attachments</h3><p>Photos, audio, video, signatures, barcodes — up to 50MB per attachment with content-addressable storage.</p></div>
+<div class="card"><h3>🌍 GPS Capture</h3><p>Point, trace, and shape geometry capture integrated into form fields.</p></div>
+<div class="card"><h3>✅ Validation</h3><p>Required fields, range checks, regex patterns, unique constraints, conditional requirements.</p></div>
+<div class="card"><h3>🔌 REST API</h3><p>Axum-powered server for form CRUD, submission ingestion, and sync status management.</p></div>
+</div>
+</div>
+</section>
+
+<section>
+<div class="container">
+<h2>Comparison</h2>
+<table>
+<tr><th>Feature</th><th>Collecta</th><th>ArcGIS Field Maps</th><th>KoboToolbox</th><th>ODK</th></tr>
+<tr><td>Open source</td><td>✅ AGPL-3.0</td><td>❌</td><td>✅</td><td>✅</td></tr>
+<tr><td>Self-hosted</td><td>✅</td><td>❌</td><td>✅</td><td>✅</td></tr>
+<tr><td>Offline-first</td><td>✅</td><td>✅</td><td>Partial</td><td>✅</td></tr>
+<tr><td>Binary size</td><td>~5 MB</td><td>~100 MB</td><td>Web</td><td>~30 MB</td></tr>
+<tr><td>Geodatabase sync</td><td>✅ (Ptolemy)</td><td>✅ (Esri)</td><td>❌</td><td>❌</td></tr>
+</table>
+</div>
+</section>
+
+<section>
+<div class="container">
+<h2>Crates</h2>
+<table>
+<tr><th>Crate</th><th>Description</th></tr>
+<tr><td><code>collecta-core</code></td><td>Form schemas, validation, sync queue, attachment handling</td></tr>
+<tr><td><code>collecta-server</code></td><td>Axum REST API for form management and submission ingestion</td></tr>
+</table>
+</div>
+</section>
+
+<footer>
+<div class="container">
+<p>Part of the <a href="https://github.com/GeoLang">GeoLang</a> geospatial platform. AGPL-3.0-or-later.</p>
+</div>
+</footer>
+</body>
+</html>
