@@ -1,0 +1,14 @@
+[package]
+name = "collecta-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Collecta REST API server — form management, submission ingestion, sync endpoints"
+
+[dependencies]
+collecta-core = { path = "../collecta-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4", "serde"] }
