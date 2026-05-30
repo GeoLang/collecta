@@ -1,11 +1,11 @@
 # Collecta
 
-**Schema-driven field data collection** — offline-first mobile forms, validation, attachments, and sync for the TileTopia ecosystem.
+**Schema-driven field data collection** — offline-first mobile forms, validation, attachments, and sync for the GeoLang ecosystem.
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
 
-> Part of the [TileTopia](https://github.com/TileTopia-HQ) geospatial platform.
+> Part of the [GeoLang](https://github.com/GeoLang) geospatial platform.
 
 ---
 
@@ -110,7 +110,7 @@ Collecta is an open-source alternative to ArcGIS Field Maps, KoboToolbox, and OD
 
 ```bash
 # Build
-git clone https://github.com/TileTopia-HQ/collecta.git
+git clone https://github.com/GeoLang/collecta.git
 cd collecta && cargo build --release
 
 # Run tests
@@ -151,18 +151,18 @@ curl -X POST http://localhost:3000/api/v1/forms \
 
 ---
 
-## Related TileTopia Projects
+## Related GeoLang Projects
 
 | Project | Integration |
 |---------|-------------|
-| [TerraVista](https://github.com/TileTopia-HQ/terravista) | Mobile rendering + GPS for field apps |
-| [Ptolemy](https://github.com/TileTopia-HQ/ptolemy) | Geodatabase backend for collected features |
-| [GeoGit](https://github.com/TileTopia-HQ/geogit) | Version control for collected datasets |
-| [ViewTopia](https://github.com/TileTopia-HQ/viewtopia) | Web viewer for submitted data |
-| [GeoKode](https://github.com/TileTopia-HQ/geokode) | Reverse geocode submission locations |
+| [TerraVista](https://github.com/GeoLang/terravista) | Mobile rendering + GPS for field apps |
+| [Ptolemy](https://github.com/GeoLang/ptolemy) | Geodatabase backend for collected features |
+| [GeoGit](https://github.com/GeoLang/geogit) | Version control for collected datasets |
+| [ViewTopia](https://github.com/GeoLang/viewtopia) | Web viewer for submitted data |
+| [GeoKode](https://github.com/GeoLang/geokode) | Reverse geocode submission locations |
 
 ---
 
 ## License
 
-AGPL-3.0-or-later · Copyright © 2024 TileTopia
+AGPL-3.0-or-later · Copyright © 2024 GeoLang
