@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            use_cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use_cross: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Build (native)
+        if: "!matrix.use_cross"
+        run: cargo build --release -p collecta-cli --target ${{ matrix.target }}
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release -p collecta-cli --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../collecta-${{ matrix.target }}.tar.gz collecta* || true
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: collecta-${{ matrix.target }}
+          path: collecta-${{ matrix.target }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "**/*.tar.gz"
+          generate_release_notes: true
