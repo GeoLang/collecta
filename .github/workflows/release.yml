@@ -51,7 +51,7 @@ jobs:
           cd target/${{ matrix.target }}/release
           tar czf ../../../collecta-${{ matrix.target }}.tar.gz collecta* || true
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: collecta-${{ matrix.target }}
           path: collecta-${{ matrix.target }}.tar.gz
