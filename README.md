@@ -1,5 +1,7 @@
 # Collecta
 
+[![CI](https://github.com/GeoLang/collecta/actions/workflows/ci.yml/badge.svg)](https://github.com/GeoLang/collecta/actions)
+
 **Schema-driven field data collection** — offline-first mobile forms, validation, attachments, and sync for the GeoLang ecosystem.
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
@@ -110,13 +112,19 @@ Collecta is an open-source alternative to ArcGIS Field Maps, KoboToolbox, and OD
 
 ```bash
 # Build
+
+[![CI](https://github.com/GeoLang/collecta/actions/workflows/ci.yml/badge.svg)](https://github.com/GeoLang/collecta/actions)
 git clone https://github.com/GeoLang/collecta.git
 cd collecta && cargo build --release
 
 # Run tests
+
+[![CI](https://github.com/GeoLang/collecta/actions/workflows/ci.yml/badge.svg)](https://github.com/GeoLang/collecta/actions)
 cargo test
 
 # Start server
+
+[![CI](https://github.com/GeoLang/collecta/actions/workflows/ci.yml/badge.svg)](https://github.com/GeoLang/collecta/actions)
 cargo run -p collecta-server
 ```
 
