@@ -3,6 +3,8 @@
 //! Forms are schema-driven: each form has a list of typed fields with
 //! validation rules, conditional visibility, and grouping.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -67,6 +69,10 @@ pub struct FormField {
     pub constraints: Vec<Constraint>,
     /// For repeat groups: nested fields.
     pub children: Option<Vec<FormField>>,
+    /// xlsform attributes the engine does not model yet, preserved verbatim
+    /// (raw constraint/relevant expressions, choice_filter, enclosing group).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
 }
 
 impl FormField {
@@ -83,6 +89,7 @@ impl FormField {
             choices: None,
             constraints: Vec::new(),
             children: None,
+            metadata: BTreeMap::new(),
         }
     }
 
@@ -99,6 +106,7 @@ impl FormField {
             choices: None,
             constraints: Vec::new(),
             children: None,
+            metadata: BTreeMap::new(),
         }
     }
 

@@ -19,8 +19,8 @@ Collecta is an open-source alternative to ArcGIS Field Maps, KoboToolbox, and OD
 - **Offline-first submissions** with sync queue and exponential backoff retry
 - **GPS capture** (point, trace, shape) integrated into forms
 - **Attachment handling** (photos, audio, video, signatures, barcodes)
-- **REST API** for form management and submission ingestion
-- **XLSForm-compatible** field types and structure
+- **REST API** for form management and submission ingestion, persisted to SQLite
+- **XLSForm import** (`.xlsx` survey/choices/settings) into the form model
 
 ### Comparison
 
@@ -100,11 +100,55 @@ Collecta is an open-source alternative to ArcGIS Field Maps, KoboToolbox, and OD
 |--------|----------|-------------|
 | GET | `/health` | Health check |
 | GET | `/api/v1/forms` | List all forms |
-| POST | `/api/v1/forms` | Create a form |
+| POST | `/api/v1/forms` | Create a form (JSON) |
+| POST | `/api/v1/forms/import` | Import an XLSForm (`.xlsx` request body) |
 | GET | `/api/v1/forms/{id}` | Get form schema |
 | GET | `/api/v1/forms/{id}/submissions` | List submissions |
 | POST | `/api/v1/forms/{id}/submissions` | Submit data (validates against schema) |
 | GET | `/api/v1/sync/status` | Get sync queue status |
+
+---
+
+## Persistence
+
+Server state is stored in SQLite (`forms`, `submissions`, `sync_queue` tables), so
+forms and submissions survive restarts. The database path comes from `COLLECTA_DB`
+(default `./collecta.db`); set `COLLECTA_DB=:memory:` for an ephemeral store.
+`COLLECTA_ADDR` sets the listen address (default `0.0.0.0:3000`).
+
+---
+
+## XLSForm Import
+
+`POST /api/v1/forms/import` accepts an [XLSForm](https://xlsform.org) `.xlsx`
+(raw body) and registers the parsed form. The engine models a subset of XLSForm;
+the importer maps what it can and preserves the rest rather than dropping it.
+
+**Supported types** (`survey.type`): `text`/`string`, `integer`, `decimal`,
+`date`, `time`, `dateTime`, `note`, `geopoint`, `geotrace`, `geoshape`, `image`/`photo`,
+`audio`, `video`, `file`, `barcode`, `signature`, `select_one <list>`,
+`select_multiple <list>`, `begin_repeat`/`end_repeat`, `begin_group`/`end_group`.
+
+**Mapping notes:**
+
+- `choices` and `settings` (`form_title`, `version`) sheets are read; sheet names
+  are matched case-insensitively.
+- `required` (`yes`/`true`/`1`) maps to the field's required flag.
+- `select_one` attaches its choice list and a `OneOf` constraint the validation
+  engine enforces. `select_multiple` attaches choices but membership is not enforced
+  (the engine does not validate multi-choice values).
+- `begin_group`/`end_group` is flattened (the model has no group container); each
+  inner field keeps its group name under `metadata.group`. `begin_repeat` maps to a
+  `Repeat` field with nested children.
+
+**Preserved as metadata, not evaluated:** raw `constraint` and `relevant`
+expressions, `constraint_message`, `choice_filter`, `appearance`, `calculation`, and
+the select `list_name` are stored on `FormField.metadata` verbatim. XLSForm
+expression evaluation is not implemented yet, so these are carried through rather
+than enforced.
+
+**Unsupported:** computed/logic types such as `calculate`, `rank`, and `range` are
+rejected with an error rather than silently coerced.
 
 ---
 

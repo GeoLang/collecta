@@ -1,0 +1,15 @@
+[package]
+name = "collecta-xlsform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "XLSForm (.xlsx) importer — maps survey/choices/settings sheets to the collecta form model"
+
+[dependencies]
+collecta-core = { path = "../collecta-core" }
+calamine = "0.36"
+serde_json = "1"
+
+[dev-dependencies]
+rust_xlsxwriter = "0.96"
+uuid = { version = "1", features = ["v4"] }

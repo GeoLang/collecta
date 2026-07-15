@@ -182,6 +182,7 @@ mod tests {
                 },
             ],
             children: None,
+            metadata: std::collections::BTreeMap::new(),
         });
         form
     }

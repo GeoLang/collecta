@@ -1,143 +1,146 @@
 //! # collecta-server
 //!
 //! REST API server for Collecta — form management, submission ingestion,
-//! and sync endpoints.
+//! and sync endpoints. State is persisted to sqlite (see [`store::Store`]).
 
-use std::sync::Arc;
+pub mod store;
 
 use axum::Router;
-use axum::extract::State;
+use axum::body::Bytes;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Json;
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use collecta_core::form::Form;
 use collecta_core::submission::Submission;
-use collecta_core::sync_queue::{SyncQueue, SyncStatus};
 use collecta_core::validation;
 
-/// Shared application state.
-struct AppState {
-    forms: RwLock<Vec<Form>>,
-    submissions: RwLock<Vec<Submission>>,
-    queue: RwLock<SyncQueue>,
-}
+use store::Store;
 
-/// Build the Axum router.
-pub fn app() -> Router {
-    let state = Arc::new(AppState {
-        forms: RwLock::new(Vec::new()),
-        submissions: RwLock::new(Vec::new()),
-        queue: RwLock::new(SyncQueue::new()),
-    });
-
+/// Build the router over an already-open [`Store`].
+pub fn router(store: Store) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/v1/forms", get(list_forms).post(create_form))
+        .route("/api/v1/forms/import", post(import_form))
         .route("/api/v1/forms/{form_id}", get(get_form))
         .route(
             "/api/v1/forms/{form_id}/submissions",
             get(list_submissions).post(submit),
         )
         .route("/api/v1/sync/status", get(sync_status))
-        .with_state(state)
+        .with_state(store)
+}
+
+/// Build the router, opening the database at `$COLLECTA_DB` (default `./collecta.db`).
+pub async fn app() -> Router {
+    let db_path = std::env::var("COLLECTA_DB").unwrap_or_else(|_| "./collecta.db".to_string());
+    let store = Store::connect(&db_path)
+        .await
+        .expect("failed to open collecta database");
+    router(store)
 }
 
 async fn health() -> &'static str {
     "ok"
 }
 
-async fn list_forms(State(state): State<Arc<AppState>>) -> Json<Vec<FormSummary>> {
-    let forms = state.forms.read().await;
-    let summaries: Vec<FormSummary> = forms
-        .iter()
-        .map(|f| FormSummary {
-            id: f.id,
-            title: f.title.clone(),
-            version: f.version,
-            field_count: f.fields.len(),
-        })
-        .collect();
-    Json(summaries)
+async fn list_forms(State(store): State<Store>) -> Result<Json<Vec<FormSummary>>, ApiError> {
+    let forms = store.list_forms().await?;
+    Ok(Json(forms.iter().map(FormSummary::from).collect()))
 }
 
 async fn create_form(
-    State(state): State<Arc<AppState>>,
+    State(store): State<Store>,
     Json(form): Json<Form>,
-) -> (StatusCode, Json<IdResponse>) {
+) -> Result<(StatusCode, Json<IdResponse>), ApiError> {
     let id = form.id;
-    state.forms.write().await.push(form);
-    (StatusCode::CREATED, Json(IdResponse { id }))
+    store.insert_form(&form).await?;
+    Ok((StatusCode::CREATED, Json(IdResponse { id })))
+}
+
+/// Import an XLSForm `.xlsx` (raw request body) and register the resulting form.
+async fn import_form(
+    State(store): State<Store>,
+    body: Bytes,
+) -> Result<(StatusCode, Json<IdResponse>), ApiError> {
+    let form = collecta_xlsform::parse_bytes(&body)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    let id = form.id;
+    store.insert_form(&form).await?;
+    Ok((StatusCode::CREATED, Json(IdResponse { id })))
 }
 
 async fn get_form(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(form_id): axum::extract::Path<Uuid>,
-) -> Result<Json<Form>, StatusCode> {
-    let forms = state.forms.read().await;
-    forms
-        .iter()
-        .find(|f| f.id == form_id)
-        .cloned()
+    State(store): State<Store>,
+    Path(form_id): Path<Uuid>,
+) -> Result<Json<Form>, ApiError> {
+    store
+        .get_form(form_id)
+        .await?
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "form not found".to_string()))
 }
 
 async fn list_submissions(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(form_id): axum::extract::Path<Uuid>,
-) -> Json<Vec<Submission>> {
-    let subs = state.submissions.read().await;
-    let filtered: Vec<Submission> = subs
-        .iter()
-        .filter(|s| s.form_id == form_id)
-        .cloned()
-        .collect();
-    Json(filtered)
+    State(store): State<Store>,
+    Path(form_id): Path<Uuid>,
+) -> Result<Json<Vec<Submission>>, ApiError> {
+    Ok(Json(store.list_submissions(form_id).await?))
 }
 
 async fn submit(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(form_id): axum::extract::Path<Uuid>,
+    State(store): State<Store>,
+    Path(form_id): Path<Uuid>,
     Json(submission): Json<Submission>,
-) -> Result<(StatusCode, Json<IdResponse>), (StatusCode, String)> {
-    // Find form
-    let forms = state.forms.read().await;
-    let form = forms
-        .iter()
-        .find(|f| f.id == form_id)
-        .ok_or((StatusCode::NOT_FOUND, "form not found".to_string()))?;
+) -> Result<(StatusCode, Json<IdResponse>), ApiError> {
+    let form = store
+        .get_form(form_id)
+        .await?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "form not found".to_string()))?;
 
-    // Validate
-    let errors = validation::validate(form, &submission);
+    let errors = validation::validate(&form, &submission);
     if !errors.is_empty() {
         let msg = errors
             .iter()
             .map(|e| e.to_string())
             .collect::<Vec<_>>()
             .join("; ");
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, msg));
+        return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg));
     }
-    drop(forms);
 
     let id = submission.id;
-    state.submissions.write().await.push(submission);
-
+    store.insert_submission(&submission).await?;
     Ok((StatusCode::CREATED, Json(IdResponse { id })))
 }
 
-async fn sync_status(State(state): State<Arc<AppState>>) -> Json<SyncStatusResponse> {
-    let queue = state.queue.read().await;
-    Json(SyncStatusResponse {
-        pending: queue.count_by_status(SyncStatus::Pending),
-        synced: queue.count_by_status(SyncStatus::Synced),
-        failed: queue.count_by_status(SyncStatus::Failed),
-        abandoned: queue.count_by_status(SyncStatus::Abandoned),
-        total: queue.len(),
-    })
+async fn sync_status(State(store): State<Store>) -> Result<Json<SyncStatusResponse>, ApiError> {
+    let counts = store.sync_counts().await?;
+    Ok(Json(SyncStatusResponse {
+        pending: counts.pending,
+        synced: counts.synced,
+        failed: counts.failed,
+        abandoned: counts.abandoned,
+        total: counts.total,
+    }))
+}
+
+/// Error carrying an HTTP status and message; storage errors map to 500.
+struct ApiError(StatusCode, String);
+
+impl From<sqlx::Error> for ApiError {
+    fn from(e: sqlx::Error) -> Self {
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    }
+}
+
+impl axum::response::IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        (self.0, self.1).into_response()
+    }
 }
 
 #[derive(Serialize)]
@@ -146,6 +149,17 @@ struct FormSummary {
     title: String,
     version: u32,
     field_count: usize,
+}
+
+impl From<&Form> for FormSummary {
+    fn from(f: &Form) -> Self {
+        FormSummary {
+            id: f.id,
+            title: f.title.clone(),
+            version: f.version,
+            field_count: f.fields.len(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
