@@ -98,7 +98,8 @@ Collecta is an open-source alternative to ArcGIS Field Maps, KoboToolbox, and OD
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/health` | Health check |
+| GET | `/health` | Health check (public) |
+| POST | `/api/v1/auth/login` | Exchange email/password for a JWT (public) |
 | GET | `/api/v1/forms` | List all forms |
 | POST | `/api/v1/forms` | Create a form (JSON) |
 | POST | `/api/v1/forms/import` | Import an XLSForm (`.xlsx` request body) |
@@ -106,15 +107,58 @@ Collecta is an open-source alternative to ArcGIS Field Maps, KoboToolbox, and OD
 | GET | `/api/v1/forms/{id}/submissions` | List submissions |
 | POST | `/api/v1/forms/{id}/submissions` | Submit data (validates against schema) |
 | GET | `/api/v1/sync/status` | Get sync queue status |
+| POST | `/api/v1/sync/push` | Batch-upload queued submissions (idempotent) |
+| GET | `/api/v1/sync/forms?since=<cursor>` | Form definitions updated since cursor |
+
+All endpoints except `/health` and login require `Authorization: Bearer <jwt>`.
+
+---
+
+## Authentication
+
+Users are admin-seeded, there is no signup endpoint. Passwords are hashed with
+argon2id; tokens are HS256 JWTs (claims `sub`/`exp`/`role`, 24h expiry, same
+conventions as tiletopia-server).
+
+```bash
+# seed a user (password read from stdin)
+cargo run -p collecta-server -- create-user admin@example.com
+
+# log in, then send the token as a bearer header
+curl -X POST http://localhost:3000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "admin@example.com", "password": "..."}'
+```
+
+---
+
+## Sync Protocol
+
+Clients queue submissions offline (`collecta-core` `SyncQueue`) and sync in two
+directions:
+
+- `POST /api/v1/sync/push` takes `{"submissions": [...]}` and returns a per-item
+  result: `accepted`, `duplicate` (that submission id is already stored, re-pushing
+  a batch never duplicates rows), or `error` with a message (validation failure,
+  unknown form). `SyncQueue::build_push_request` / `apply_push_response` implement
+  the client side over the shared `sync_protocol` wire types.
+- `GET /api/v1/sync/forms?since=<cursor>` returns form definitions updated after
+  the cursor plus the next cursor; omit `since` for a full refresh. The cursor is
+  opaque (currently an rfc3339 timestamp) — store and echo it back url-encoded.
 
 ---
 
 ## Persistence
 
-Server state is stored in SQLite (`forms`, `submissions`, `sync_queue` tables), so
-forms and submissions survive restarts. The database path comes from `COLLECTA_DB`
-(default `./collecta.db`); set `COLLECTA_DB=:memory:` for an ephemeral store.
-`COLLECTA_ADDR` sets the listen address (default `0.0.0.0:3000`).
+Server state is stored in SQLite (`forms`, `submissions`, `sync_queue`, `users`
+tables), so forms and submissions survive restarts.
+
+Environment variables:
+
+- `COLLECTA_DB` — database path (default `./collecta.db`; `:memory:` for ephemeral)
+- `COLLECTA_ADDR` — listen address (default `0.0.0.0:3000`)
+- `COLLECTA_JWT_SECRET` — JWT signing secret, required, at least 32 bytes
+  (e.g. `openssl rand -hex 32`); the server refuses to start without it
 
 ---
 

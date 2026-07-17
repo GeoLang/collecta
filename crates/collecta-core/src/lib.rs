@@ -7,6 +7,7 @@ pub mod attachment;
 pub mod error;
 pub mod form;
 pub mod submission;
+pub mod sync_protocol;
 pub mod sync_queue;
 pub mod validation;
 

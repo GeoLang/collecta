@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::submission::Submission;
+use crate::sync_protocol::{PushItemStatus, PushRequest, PushResponse};
 
 /// Offline sync queue — stores submissions pending upload.
 pub struct SyncQueue {
@@ -126,6 +127,38 @@ impl SyncQueue {
         self.items.iter().filter(|i| i.status == status).count()
     }
 
+    /// Build a push batch from every item currently pending sync.
+    pub fn build_push_request(&self) -> PushRequest {
+        PushRequest {
+            submissions: self
+                .pending()
+                .iter()
+                .map(|item| item.submission.clone())
+                .collect(),
+        }
+    }
+
+    /// Apply the server's per-item push results to the queue.
+    ///
+    /// `Accepted` and `Duplicate` both mean the server has the submission,
+    /// so both mark the item synced; `Error` marks it failed for retry.
+    pub fn apply_push_response(&mut self, response: &PushResponse) {
+        for result in &response.results {
+            match result.status {
+                PushItemStatus::Accepted | PushItemStatus::Duplicate => {
+                    self.mark_synced(result.id);
+                }
+                PushItemStatus::Error => {
+                    let message = result
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "server rejected submission".to_string());
+                    self.mark_failed(result.id, message);
+                }
+            }
+        }
+    }
+
     /// Get backoff duration in seconds for a given retry count.
     pub fn backoff_seconds(retry_count: u32) -> u64 {
         // Exponential: 2^retry * 5 seconds, capped at 5 minutes
@@ -190,6 +223,50 @@ mod tests {
         queue.mark_failed(sub_id, "timeout".to_string());
         assert_eq!(queue.count_by_status(SyncStatus::Abandoned), 1);
         assert_eq!(queue.pending().len(), 0); // no longer retryable
+    }
+
+    #[test]
+    fn test_push_round_trip() {
+        use crate::sync_protocol::{PushItemResult, PushItemStatus, PushResponse};
+
+        let mut queue = SyncQueue::new();
+        let ok = Submission::new(Uuid::new_v4(), 1);
+        let dup = Submission::new(Uuid::new_v4(), 1);
+        let bad = Submission::new(Uuid::new_v4(), 1);
+        let (ok_id, dup_id, bad_id) = (ok.id, dup.id, bad.id);
+        queue.enqueue(ok);
+        queue.enqueue(dup);
+        queue.enqueue(bad);
+
+        let request = queue.build_push_request();
+        assert_eq!(request.submissions.len(), 3);
+
+        let response = PushResponse {
+            results: vec![
+                PushItemResult {
+                    id: ok_id,
+                    status: PushItemStatus::Accepted,
+                    message: None,
+                },
+                PushItemResult {
+                    id: dup_id,
+                    status: PushItemStatus::Duplicate,
+                    message: None,
+                },
+                PushItemResult {
+                    id: bad_id,
+                    status: PushItemStatus::Error,
+                    message: Some("missing required field".to_string()),
+                },
+            ],
+        };
+        queue.apply_push_response(&response);
+
+        assert_eq!(queue.count_by_status(SyncStatus::Synced), 2);
+        assert_eq!(queue.count_by_status(SyncStatus::Failed), 1);
+        // only the failed item is retried on the next push.
+        assert_eq!(queue.build_push_request().submissions.len(), 1);
+        assert_eq!(queue.build_push_request().submissions[0].id, bad_id);
     }
 
     #[test]
