@@ -261,4 +261,6 @@ curl -X POST http://localhost:3000/api/v1/forms \
 
 ## License
 
-AGPL-3.0-or-later · Copyright © 2024 GeoLang
+AGPL-3.0-or-later, see [LICENSE](LICENSE).
+
+Copyright (C) 2026 Grok Image Compression Inc.
