@@ -143,20 +143,30 @@ impl Store {
         Ok(row.as_ref().map(row_json))
     }
 
-    /// Forms updated strictly after `since` (lexicographic on rfc3339
-    /// timestamps), oldest first, plus the cursor for the next pull.
-    /// An empty `since` returns everything.
+    /// Forms updated after `since`, oldest first, plus the cursor for the next
+    /// pull. An empty `since` returns everything.
+    ///
+    /// The cursor is `<rfc3339>@<rowid>` and compares as a pair: on the
+    /// timestamp alone, a form written in the same microsecond as the one the
+    /// cursor points at would be skipped forever. A bare timestamp from an
+    /// older client reads as rowid 0, which re-delivers that microsecond
+    /// instead of skipping it.
     pub async fn list_forms_since(
         &self,
         since: &str,
     ) -> Result<(Vec<Form>, Option<String>), sqlx::Error> {
+        let (updated_at, rowid) = parse_cursor(since);
         let rows = sqlx::query(
-            "SELECT data, updated_at FROM forms WHERE updated_at > ? ORDER BY updated_at, rowid",
+            "SELECT data, updated_at, rowid FROM forms
+             WHERE updated_at > ? OR (updated_at = ? AND rowid > ?)
+             ORDER BY updated_at, rowid",
         )
-        .bind(since)
+        .bind(updated_at)
+        .bind(updated_at)
+        .bind(rowid)
         .fetch_all(&self.pool)
         .await?;
-        let cursor = rows.last().map(|row| row.get("updated_at"));
+        let cursor = rows.last().map(format_cursor);
         Ok((rows.iter().map(row_json).collect(), cursor))
     }
 
@@ -277,6 +287,20 @@ impl Store {
 // chronological order for the forms cursor.
 fn timestamp_now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+// anything without a parsable `@<rowid>` suffix is a bare timestamp.
+fn parse_cursor(since: &str) -> (&str, i64) {
+    since
+        .rsplit_once('@')
+        .and_then(|(updated_at, rowid)| rowid.parse().ok().map(|rowid| (updated_at, rowid)))
+        .unwrap_or((since, 0))
+}
+
+fn format_cursor(row: &sqlx::sqlite::SqliteRow) -> String {
+    let updated_at: String = row.get("updated_at");
+    let rowid: i64 = row.get("rowid");
+    format!("{updated_at}@{rowid}")
 }
 
 fn status_label(status: SyncStatus) -> &'static str {

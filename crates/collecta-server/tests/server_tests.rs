@@ -13,6 +13,7 @@ use collecta_server::store::{Store, UserRecord};
 use rust_xlsxwriter::Workbook;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -351,6 +352,62 @@ async fn sync_forms_since_cursor() {
     let pull3: FormsPullResponse = json_body(resp).await;
     assert!(pull3.forms.is_empty());
     assert_eq!(pull3.cursor, pull2.cursor);
+}
+
+// two forms sharing an updated_at straddle any timestamp-only cursor: one of
+// them is on the wrong side of `>` and never comes back. The rowid tiebreak is
+// what makes the pair reachable.
+#[tokio::test]
+async fn sync_forms_cursor_tiebreaks_identical_timestamps() {
+    const SAME_MICROSECOND: &str = "2026-01-01T00:00:00.000000Z";
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("collecta.db").to_str().unwrap().to_string();
+    let store = seeded_store(&db).await;
+
+    let form_a = Form::new("First");
+    let form_b = Form::new("Second");
+    store.insert_form(&form_a).await.unwrap();
+    store.insert_form(&form_b).await.unwrap();
+
+    // the clock makes this collision rare, not impossible: force it.
+    let pool = SqlitePool::connect_with(SqliteConnectOptions::new().filename(&db))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE forms SET updated_at = ?")
+        .bind(SAME_MICROSECOND)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let rowid_a: i64 = sqlx::query_scalar("SELECT rowid FROM forms WHERE id = ?")
+        .bind(form_a.id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let app = router(store, TEST_SECRET);
+    let token = login(&app, TEST_EMAIL, TEST_PASSWORD).await;
+
+    // a client holding the cursor for form_a must still be given form_b.
+    let cursor = format!("{SAME_MICROSECOND}@{rowid_a}");
+    let uri = format!("/api/v1/sync/forms?since={}", urlencode(&cursor));
+    let resp = app.clone().oneshot(get(&uri, &token)).await.unwrap();
+    let pull: FormsPullResponse = json_body(resp).await;
+    assert_eq!(pull.forms.len(), 1, "form written in the same microsecond");
+    assert_eq!(pull.forms[0].id, form_b.id);
+
+    // and the cursor it returns is exhausted, so form_b is not resent forever.
+    let uri = format!("/api/v1/sync/forms?since={}", urlencode(&pull.cursor));
+    let resp = app.clone().oneshot(get(&uri, &token)).await.unwrap();
+    let pull2: FormsPullResponse = json_body(resp).await;
+    assert!(pull2.forms.is_empty());
+
+    // a bare timestamp from a pre-compound client re-delivers its microsecond
+    // rather than skipping past it.
+    let uri = format!("/api/v1/sync/forms?since={}", urlencode(SAME_MICROSECOND));
+    let resp = app.clone().oneshot(get(&uri, &token)).await.unwrap();
+    let pull3: FormsPullResponse = json_body(resp).await;
+    assert_eq!(pull3.forms.len(), 2);
 }
 
 fn urlencode(s: &str) -> String {

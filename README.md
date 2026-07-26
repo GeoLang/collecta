@@ -144,7 +144,7 @@ directions:
   the client side over the shared `sync_protocol` wire types.
 - `GET /api/v1/sync/forms?since=<cursor>` returns form definitions updated after
   the cursor plus the next cursor; omit `since` for a full refresh. The cursor is
-  opaque (currently an rfc3339 timestamp) — store and echo it back url-encoded.
+  opaque (currently `<rfc3339>@<rowid>`) — store and echo it back url-encoded.
 
 ---
 
