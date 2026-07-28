@@ -33,7 +33,7 @@ footer{padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
 <header>
 <div class="container">
 <h1>📋 Collecta</h1>
-<p class="tagline">Schema-driven field data collection — offline-first mobile forms, validation, attachments, and sync.</p>
+<p class="tagline">Schema-driven field data collection: form schemas, validation, JWT auth, and a sync protocol. Server and shared library, no field app yet.</p>
 <div class="badges">
 <img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" alt="License">
 <img src="https://img.shields.io/badge/Rust-2024_edition-orange.svg" alt="Rust">
@@ -46,25 +46,31 @@ footer{padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
 <h2>Features</h2>
 <div class="grid">
 <div class="card"><h3>📝 Form Schemas</h3><p>20+ field types with conditional logic, validation constraints, and XLSForm-compatible structure.</p></div>
-<div class="card"><h3>📡 Offline-First Sync</h3><p>Queue submissions offline with exponential backoff retry. Never lose field data.</p></div>
-<div class="card"><h3>📎 Attachments</h3><p>Photos, audio, video, signatures, barcodes — up to 50MB per attachment with content-addressable storage.</p></div>
-<div class="card"><h3>🌍 GPS Capture</h3><p>Point, trace, and shape geometry capture integrated into form fields.</p></div>
-<div class="card"><h3>✅ Validation</h3><p>Required fields, range checks, regex patterns, unique constraints, conditional requirements.</p></div>
-<div class="card"><h3>🔌 REST API</h3><p>Axum-powered server for form CRUD, submission ingestion, and sync status management.</p></div>
+<div class="card"><h3>📡 Sync Protocol</h3><p>Idempotent submission push and cursor-based form pull. A <code>SyncQueue</code> library type with exponential backoff retry is provided for a client to drive.</p></div>
+<div class="card"><h3>📎 Attachments (deferred)</h3><p>Photo, audio, video, signature, and barcode exist as form field types, and an <code>Attachment</code> struct exists in the core library. The server has no upload endpoint and no blob storage, so nothing captures a photo today.</p></div>
+<div class="card"><h3>🌍 GPS Field Types</h3><p>Point, trace, and shape geometry types in the form model, with latitude, longitude, altitude, and accuracy. Capture happens in the client.</p></div>
+<div class="card"><h3>✅ Validation</h3><p>Required fields, numeric range checks, text length, glob-style patterns, and OneOf sets. All errors are reported, not just the first.</p></div>
+<div class="card"><h3>🔌 REST API</h3><p>Axum server for form CRUD, XLSForm import, submission ingestion, and sync, persisted to SQLite. JWT auth with argon2id hashing.</p></div>
 </div>
 </div>
 </section>
 
 <section>
 <div class="container">
-<h2>Comparison</h2>
+<h2>Status</h2>
+<p>Collecta aims to be an open-source alternative to ArcGIS Field Maps, KoboToolbox, and ODK Collect. Today it is the server and the shared schema library, not the field app.</p>
 <table>
-<tr><th>Feature</th><th>Collecta</th><th>ArcGIS Field Maps</th><th>KoboToolbox</th><th>ODK</th></tr>
-<tr><td>Open source</td><td>✅ AGPL-3.0</td><td>❌</td><td>✅</td><td>✅</td></tr>
-<tr><td>Self-hosted</td><td>✅</td><td>❌</td><td>✅</td><td>✅</td></tr>
-<tr><td>Offline-first</td><td>✅</td><td>✅</td><td>Partial</td><td>✅</td></tr>
-<tr><td>Binary size</td><td>~5 MB</td><td>~100 MB</td><td>Web</td><td>~30 MB</td></tr>
-<tr><td>Geodatabase sync</td><td>✅ (Ptolemy)</td><td>✅ (Esri)</td><td>❌</td><td>❌</td></tr>
+<tr><th>Capability</th><th>Status</th></tr>
+<tr><td>Form schemas, validation, conditional logic, repeat groups</td><td>Working</td></tr>
+<tr><td>REST API with SQLite persistence</td><td>Working</td></tr>
+<tr><td>JWT auth, argon2id hashing, admin-seeded users</td><td>Working</td></tr>
+<tr><td>Sync push and cursor-based form pull</td><td>Working</td></tr>
+<tr><td>XLSForm import</td><td>Working, expressions carried as metadata but not evaluated</td></tr>
+<tr><td>Mobile or desktop client</td><td>Not built, no client and no FFI layer</td></tr>
+<tr><td>Media attachment capture and upload</td><td>Deferred, no endpoint and no blob storage</td></tr>
+<tr><td>Deletes and tombstones in sync</td><td>Not implemented</td></tr>
+<tr><td>Role-based authorization</td><td>Not implemented, the role claim is not checked</td></tr>
+<tr><td>Ptolemy geodatabase integration</td><td>Planned, not wired up</td></tr>
 </table>
 </div>
 </section>
@@ -74,7 +80,8 @@ footer{padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
 <h2>Crates</h2>
 <table>
 <tr><th>Crate</th><th>Description</th></tr>
-<tr><td><code>collecta-core</code></td><td>Form schemas, validation, sync queue, attachment handling</td></tr>
+<tr><td><code>collecta-core</code></td><td>Form schemas, validation, sync queue and attachment types</td></tr>
+<tr><td><code>collecta-xlsform</code></td><td>XLSForm (.xlsx) importer</td></tr>
 <tr><td><code>collecta-server</code></td><td>Axum REST API for form management and submission ingestion</td></tr>
 </table>
 </div>

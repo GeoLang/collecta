@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/GeoLang/collecta/actions/workflows/ci.yml/badge.svg)](https://github.com/GeoLang/collecta/actions)
 
-**Schema-driven field data collection** — offline-first mobile forms, validation, attachments, and sync for the GeoLang ecosystem.
+**Schema-driven field data collection**: form schemas, validation, JWT auth, and a sync protocol for the GeoLang ecosystem.
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
@@ -13,29 +13,39 @@
 
 ## Overview
 
-Collecta is an open-source alternative to ArcGIS Field Maps, KoboToolbox, and ODK Collect. It provides:
+Collecta aims to be an open-source alternative to ArcGIS Field Maps, KoboToolbox, and
+ODK Collect. Today it is the server and the shared schema library, not the field app.
+It provides:
 
 - **Form schemas** with typed fields, conditional logic, and validation constraints
-- **Offline-first submissions** with sync queue and exponential backoff retry
-- **GPS capture** (point, trace, shape) integrated into forms
-- **Attachment handling** (photos, audio, video, signatures, barcodes)
+- **GPS capture types** (point, trace, shape) in the form model
 - **REST API** for form management and submission ingestion, persisted to SQLite
+- **JWT auth** with argon2id password hashing and admin-seeded users
+- **Sync protocol**: idempotent submission push and cursor-based form pull
 - **XLSForm import** (`.xlsx` survey/choices/settings) into the form model
+- **Offline sync queue** as a library type in `collecta-core`, for a client to build on
 
-### Comparison
+### Status
 
-| Feature | Collecta | ArcGIS Field Maps | KoboToolbox | ODK Collect |
-|---------|----------|-------------------|-------------|-------------|
-| Open source | ✅ AGPL-3.0 | ❌ | ✅ (AGPL) | ✅ (Apache) |
-| Self-hosted | ✅ | ❌ | ✅ | ✅ |
-| Offline-first | ✅ | ✅ | Partial | ✅ |
-| Binary size | ~5 MB | ~100 MB | Web-based | ~30 MB |
-| GPS accuracy tracking | ✅ | ✅ | ✅ | ✅ |
-| Geodatabase integration | ✅ (Ptolemy) | ✅ (Esri) | ❌ | ❌ |
-| Single binary server | ✅ | ❌ | ❌ (Django) | ❌ (Java) |
-| Repeat groups | ✅ | ✅ | ✅ | ✅ |
-| Conditional logic | ✅ | ✅ | ✅ | ✅ |
-| Barcode/QR scan | ✅ | ✅ | ✅ | ✅ |
+**Working:** the Axum server, SQLite persistence, JWT auth, form CRUD, submission
+validation and ingestion, XLSForm import, and the push/pull sync endpoints. All are
+covered by tests (`cargo test` runs 57).
+
+**Not built yet:**
+
+- **No client application.** There is no mobile app, desktop app, or FFI layer. The
+  `SyncQueue` and `AttachmentStore` types in `collecta-core` are there for a client
+  author to use, and nothing in this repo uses them.
+- **Media attachments are deferred.** `Photo`, `Audio`, `Video`, `File`, and `Signature`
+  exist as form field types and an `Attachment` struct exists in `collecta-core`, but
+  the server has no upload or download endpoint, no multipart handling, and no blob
+  table. Nothing captures or stores a photo today.
+- **No deletes.** There are no tombstones and no delete endpoints for forms or
+  submissions, so sync cannot propagate a deletion.
+- **Roles are not enforced.** The JWT carries a `role` claim and no endpoint checks it.
+  Any valid token gets full access.
+- **No Ptolemy integration.** Writing collected features through to the geodatabase is
+  planned, not wired up.
 
 ---
 
@@ -43,7 +53,7 @@ Collecta is an open-source alternative to ArcGIS Field Maps, KoboToolbox, and OD
 
 ```
 ┌────────────────────────────────────────────────────────┐
-│  Mobile App (TerraVista + Collecta FFI)                │
+│  Mobile App (TerraVista + Collecta FFI)     [PLANNED]  │
 │  ┌──────────┐  ┌──────────┐  ┌──────────────────────┐ │
 │  │  Form    │  │  Offline │  │    Attachment         │ │
 │  │  Render  │  │  Queue   │  │    Store (photos,     │ │
@@ -59,9 +69,12 @@ Collecta is an open-source alternative to ArcGIS Field Maps, KoboToolbox, and OD
 │  collecta-server (Axum REST API)                       │
 │  Form CRUD · Submission ingestion · Sync endpoints     │
 ├────────────────────────────────────────────────────────┤
-│  ptolemy (geodatabase) — versioned spatial storage      │
+│  ptolemy (geodatabase) — spatial storage    [PLANNED]  │
 └────────────────────────────────────────────────────────┘
 ```
+
+The top and bottom layers are the target design. Only the two middle layers,
+`collecta-core` and `collecta-server`, exist in this repo.
 
 ---
 
@@ -70,7 +83,7 @@ Collecta is an open-source alternative to ArcGIS Field Maps, KoboToolbox, and OD
 ### Form Schema
 
 - **20+ field types**: Text, Integer, Decimal, Date, DateTime, Time, Select, MultiSelect, GeoPoint, GeoTrace, GeoShape, Photo, Audio, Video, File, Barcode, Signature, Boolean, Repeat, Note
-- **Validation constraints**: Min/Max value, Min/Max length, regex pattern, OneOf
+- **Validation constraints**: Min/Max value, Min/Max length, glob-style pattern, OneOf
 - **Conditional visibility**: Show/hide fields based on other field values
 - **Repeat groups**: Nested sub-forms for multiple entries (e.g., "list all items inspected")
 - **Default values**: Pre-fill fields with constants or calculated values
@@ -78,11 +91,13 @@ Collecta is an open-source alternative to ArcGIS Field Maps, KoboToolbox, and OD
 
 ### Offline Sync Queue
 
-- **Queue all submissions locally** — no connectivity required to collect data
-- **Exponential backoff retry** — 5s → 10s → 20s → 40s → ... capped at 5min
+A `collecta-core` library type for a client to drive. No client in this repo uses it.
+
+- **Queue submissions locally** so collection does not need connectivity
+- **Exponential backoff retry**: 5s → 10s → 20s → 40s → ... capped at 5min
 - **Max retries** with permanent failure status after threshold
 - **Status tracking**: Pending, InProgress, Synced, Failed, Abandoned
-- **Attachment sync** — binary files synced separately with progress tracking
+- Submissions only. Attachment sync is not implemented on either side.
 
 ### Validation Engine
 
@@ -110,15 +125,17 @@ Collecta is an open-source alternative to ArcGIS Field Maps, KoboToolbox, and OD
 | POST | `/api/v1/sync/push` | Batch-upload queued submissions (idempotent) |
 | GET | `/api/v1/sync/forms?since=<cursor>` | Form definitions updated since cursor |
 
-All endpoints except `/health` and login require `Authorization: Bearer <jwt>`.
+All endpoints except `/health` and login require `Authorization: Bearer <jwt>`. There is
+no attachment upload endpoint and no delete endpoint.
 
 ---
 
 ## Authentication
 
 Users are admin-seeded, there is no signup endpoint. Passwords are hashed with
-argon2id; tokens are HS256 JWTs (claims `sub`/`exp`/`role`, 24h expiry, same
-conventions as tiletopia-server).
+argon2id, tokens are HS256 JWTs (claims `sub`/`exp`/`role`, 24h expiry, same
+conventions as tiletopia-server). The `role` claim is carried but not checked: every
+valid token has the same access.
 
 ```bash
 # seed a user (password read from stdin)
@@ -145,6 +162,9 @@ directions:
 - `GET /api/v1/sync/forms?since=<cursor>` returns form definitions updated after
   the cursor plus the next cursor; omit `since` for a full refresh. The cursor is
   opaque (currently `<rfc3339>@<rowid>`) — store and echo it back url-encoded.
+
+Deletion does not sync. There are no tombstones, so a form or submission removed on
+one side stays on the other. Attachments are not part of the protocol.
 
 ---
 
@@ -200,19 +220,13 @@ rejected with an error rather than silently coerced.
 
 ```bash
 # Build
-
-[![CI](https://github.com/GeoLang/collecta/actions/workflows/ci.yml/badge.svg)](https://github.com/GeoLang/collecta/actions)
 git clone https://github.com/GeoLang/collecta.git
 cd collecta && cargo build --release
 
 # Run tests
-
-[![CI](https://github.com/GeoLang/collecta/actions/workflows/ci.yml/badge.svg)](https://github.com/GeoLang/collecta/actions)
 cargo test
 
 # Start server
-
-[![CI](https://github.com/GeoLang/collecta/actions/workflows/ci.yml/badge.svg)](https://github.com/GeoLang/collecta/actions)
 cargo run -p collecta-server
 ```
 
@@ -236,7 +250,7 @@ curl -X POST http://localhost:3000/api/v1/forms \
 
 ---
 
-## Use Cases
+## Target Use Cases
 
 - **Utility inspections** — pole/pipe condition surveys with GPS and photos
 - **Environmental monitoring** — water quality sampling, species observations
@@ -251,7 +265,7 @@ curl -X POST http://localhost:3000/api/v1/forms \
 
 | Project | Integration |
 |---------|-------------|
-| [TerraVista](https://github.com/GeoLang/terravista) | Mobile rendering + GPS for field apps |
+| [TerraVista](https://github.com/GeoLang/terravista) | Map engine core for a future field app |
 | [Ptolemy](https://github.com/GeoLang/ptolemy) | Geodatabase backend for collected features |
 | [GeoGit](https://github.com/GeoLang/geogit) | Version control for collected datasets |
 | [ViewTopia](https://github.com/GeoLang/viewtopia) | Web viewer for submitted data |
