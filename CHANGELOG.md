@@ -8,4 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Initial release
+- OpenRosa compatibility layer so ODK Collect can use collecta as its server:
+  `GET /formList`, `GET /forms/{id}/form.xml`, and `HEAD`/`POST /submission`,
+  authenticated with HTTP Basic against the existing users table.
+- XForm generation from the stored form model, copying the preserved raw
+  relevant/constraint/calculation XPath into the binds for Collect to evaluate.
+- Submission ingest: instance XML parsed into typed field values, run through the
+  existing validation engine, made idempotent on `meta/instanceID`.
+- Attachment storage on disk under `COLLECTA_DATA_DIR`, indexed by a new
+  `attachments` table, with per-part and per-request size limits.
+- `COLLECTA_DATA_DIR` and `COLLECTA_BASE_URL` environment variables.
+
+### Changed
+- `router()` now takes a `Config` instead of a bare JWT secret. The `/api/v1`
+  routes themselves are unchanged.

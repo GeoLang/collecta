@@ -141,19 +141,7 @@ async fn read_parts(
     let mut attachments = Vec::new();
 
     loop {
-        let field = multipart.next_field().await.map_err(|e| {
-            // a body over the layer's limit surfaces here; report it as the
-            // protocol's "too large" rather than a generic failure.
-            let status = e.status();
-            if status == StatusCode::PAYLOAD_TOO_LARGE {
-                error(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "submission exceeds the accepted content length",
-                )
-            } else {
-                error(StatusCode::BAD_REQUEST, "malformed multipart body")
-            }
-        })?;
+        let field = multipart.next_field().await.map_err(multipart_error)?;
         let Some(field) = field else { break };
 
         let name = field.name().unwrap_or_default().to_string();
@@ -184,6 +172,22 @@ async fn read_parts(
     Ok((instance_xml, attachments))
 }
 
+/// Keep the extractor's own status where it is meaningful.
+///
+/// A body over the route's `DefaultBodyLimit` surfaces as 413 from either
+/// `next_field` or `chunk`, and must stay a 413: the spec has a status for
+/// "too large" and Collect acts on it differently from a malformed body.
+fn multipart_error(e: axum::extract::multipart::MultipartError) -> OpenRosaError {
+    if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "submission exceeds the accepted content length",
+        )
+    } else {
+        error(StatusCode::BAD_REQUEST, "malformed multipart body")
+    }
+}
+
 /// Buffer one part, aborting as soon as it passes the per-part cap.
 ///
 /// Read chunk by chunk rather than with `Field::bytes()` so an oversized part
@@ -191,10 +195,7 @@ async fn read_parts(
 async fn read_capped(mut field: Field<'_>) -> Result<Vec<u8>, OpenRosaError> {
     let mut bytes: Vec<u8> = Vec::new();
     loop {
-        let chunk = field
-            .chunk()
-            .await
-            .map_err(|_| error(StatusCode::BAD_REQUEST, "malformed multipart part"))?;
+        let chunk = field.chunk().await.map_err(multipart_error)?;
         let Some(chunk) = chunk else { break };
         if bytes.len() + chunk.len() > MAX_CONTENT_LENGTH {
             return Err(error(

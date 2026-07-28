@@ -1056,6 +1056,81 @@ async fn attachments_above_the_default_body_limit_are_accepted() {
     assert_eq!(attachments[0].size_bytes, size as u64);
 }
 
+#[tokio::test]
+async fn a_request_over_the_total_body_limit_is_413_not_400() {
+    let (app, form, store, _dir) = app_parts_with_dir().await;
+    let xml = instance_xml(
+        form.id,
+        "uuid:aaaa1111-0000-0000-0000-000000000006",
+        "<q_text>Alpha</q_text>",
+    );
+
+    // two parts, each comfortably inside the per-part cap, together over the
+    // request cap: only the body limit can catch this, not the per-part check.
+    let half = collecta_server::openrosa::MAX_REQUEST_BODY / 2 + 1024 * 1024;
+    assert!(half < collecta_server::openrosa::MAX_CONTENT_LENGTH);
+    let resp = post_submission(
+        &app,
+        &[
+            instance_part(&xml),
+            part(
+                "a.bin",
+                Some("a.bin"),
+                "application/octet-stream",
+                vec![b'a'; half],
+            ),
+            part(
+                "b.bin",
+                Some("b.bin"),
+                "application/octet-stream",
+                vec![b'b'; half],
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(store.list_submissions(form.id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_same_instance_id_on_a_different_form_is_a_separate_submission() {
+    let (app, form, store, _dir) = app_parts_with_dir().await;
+
+    // a second form, so the two share an instanceID but nothing else.
+    let mut other = kitchen_sink_form();
+    other.title = "Other".to_string();
+    store.insert_form(&other).await.unwrap();
+
+    let instance_id = "uuid:aaaa1111-0000-0000-0000-000000000007";
+    for form_id in [form.id, other.id] {
+        let xml = instance_xml(form_id, instance_id, "<q_text>Alpha</q_text>");
+        assert_eq!(
+            post_submission(&app, &[instance_part(&xml)]).await.status(),
+            StatusCode::CREATED,
+            "instanceID uniqueness is scoped to one form"
+        );
+    }
+
+    // neither clobbered the other.
+    assert_eq!(store.list_submissions(form.id).await.unwrap().len(), 1);
+    assert_eq!(store.list_submissions(other.id).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn openrosa_headers_do_not_leak_onto_the_json_api() {
+    let (app, _form, _store) = app_parts().await;
+
+    let resp = app
+        .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().get("x-openrosa-version").is_none(),
+        "the openrosa layer must stay on its own routes"
+    );
+}
+
 // ---- fixtures ----------------------------------------------------------
 
 fn kitchen_sink_form() -> Form {

@@ -28,22 +28,23 @@ It provides:
 ### Status
 
 **Working:** the Axum server, SQLite persistence, JWT auth, form CRUD, submission
-validation and ingestion, XLSForm import, and the push/pull sync endpoints. All are
-covered by tests (`cargo test` runs 57).
+validation and ingestion, XLSForm import, the push/pull sync endpoints, and an
+OpenRosa compatibility layer that ODK Collect can submit to. All are covered by
+tests (`cargo test` runs 91).
 
 **Not built yet:**
 
-- **No client application.** There is no mobile app, desktop app, or FFI layer. The
-  `SyncQueue` and `AttachmentStore` types in `collecta-core` are there for a client
-  author to use, and nothing in this repo uses them.
-- **Media attachments are deferred.** `Photo`, `Audio`, `Video`, `File`, and `Signature`
-  exist as form field types and an `Attachment` struct exists in `collecta-core`, but
-  the server has no upload or download endpoint, no multipart handling, and no blob
-  table. Nothing captures or stores a photo today.
+- **No first-party client application.** There is no mobile app, desktop app, or FFI
+  layer of our own; ODK Collect is the supported client. The `SyncQueue` and
+  `AttachmentStore` types in `collecta-core` are there for a client author to use, and
+  nothing in this repo uses them.
+- **No attachment download.** Attachments arrive over OpenRosa and are written to disk
+  and indexed, but there is no endpoint to read one back out. Files are on disk under
+  the data directory and in the `attachments` table.
 - **No deletes.** There are no tombstones and no delete endpoints for forms or
   submissions, so sync cannot propagate a deletion.
 - **Roles are not enforced.** The JWT carries a `role` claim and no endpoint checks it.
-  Any valid token gets full access.
+  Any valid account can read and write every form, over either API.
 - **No Ptolemy integration.** Writing collected features through to the geodatabase is
   planned, not wired up.
 
@@ -126,7 +127,59 @@ A `collecta-core` library type for a client to drive. No client in this repo use
 | GET | `/api/v1/sync/forms?since=<cursor>` | Form definitions updated since cursor |
 
 All endpoints except `/health` and login require `Authorization: Bearer <jwt>`. There is
-no attachment upload endpoint and no delete endpoint.
+no delete endpoint.
+
+---
+
+## OpenRosa (ODK Collect)
+
+Collecta serves the OpenRosa APIs at the server root, so ODK Collect can use it as
+its server. Point Collect at the server URL and give it an account created with
+`create-user`.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/formList` | Form list XML, one entry per renderable form |
+| GET | `/forms/{id}/form.xml` | The form rendered as an ODK XForm |
+| HEAD | `/submission` | Auth and capability preflight (204) |
+| POST | `/submission` | `multipart/form-data` submission plus attachments |
+
+These routes use **HTTP Basic** against the same users table as the JSON API, since
+Collect has no concept of a bearer token. A request without credentials gets a 401
+with `WWW-Authenticate: Basic realm="collecta"`, which is the challenge Collect waits
+for. **Run this behind TLS**: the OpenRosa auth spec forbids Basic over plain HTTP,
+and nothing here can enforce that for you. Every response carries
+`X-OpenRosa-Version: 1.0`; bodies are `OpenRosaResponse` envelopes.
+
+Forms are generated from the stored form model. Field types map to XForm binds
+(`text`→`xsd:string`, `integer`→`xsd:int`, `geopoint`/`geotrace`/`geoshape`,
+`photo`/`audio`/`video`/`file`/`signature`→`binary` uploads, `select_one`→`select1`
+with inline choices, repeats→repeat groups). The raw `relevant`, `constraint`,
+`calculation`, and `constraint_message` expressions the XLSForm importer preserved
+are copied into the binds verbatim: they are XPath, and **Collect evaluates them on
+the device**. Collecta still does not evaluate them server-side, so what the server
+enforces on ingest is only what its own validation engine models.
+
+`meta/instanceID` is the idempotency key. Collect splits a large submission across
+several POSTs, repeating the identical instance XML each time, so:
+
+- a repeat POST of the same instanceID adds attachments and does not create a second
+  submission (201 either way, as the spec requires),
+- the same instanceID with **different** XML is a collision, not a resubmission, and
+  returns 409 without touching the stored record,
+- an instanceID already held by a **different** user also returns 409,
+- the same instanceID under a different form is an independent submission.
+
+Attachments are written to `<data dir>/attachments/<submission uuid>/<attachment
+uuid>`. Both path components are server-generated UUIDs; the client's file name is
+recorded as metadata only and never becomes a path component. Parts are capped at
+50 MB each (the advertised `X-OpenRosa-Accept-Content-Length`) with a slightly larger
+whole-request cap; oversized requests get 413.
+
+**Not supported:** form manifests and external media (`manifestUrl` is not emitted),
+`listAllVersions`, `verbose` descriptions, entity lists, encrypted forms, Digest auth,
+and draft/test endpoints. A form whose field names are not valid XML names cannot be
+rendered as an XForm and is omitted from `/formList`.
 
 ---
 
@@ -170,8 +223,9 @@ one side stays on the other. Attachments are not part of the protocol.
 
 ## Persistence
 
-Server state is stored in SQLite (`forms`, `submissions`, `sync_queue`, `users`
-tables), so forms and submissions survive restarts.
+Server state is stored in SQLite (`forms`, `submissions`, `sync_queue`, `users`,
+`attachments` tables), so forms and submissions survive restarts. Attachment bytes
+live on disk under the data directory; the table holds their metadata and paths.
 
 Environment variables:
 
@@ -179,6 +233,11 @@ Environment variables:
 - `COLLECTA_ADDR` — listen address (default `0.0.0.0:3000`)
 - `COLLECTA_JWT_SECRET` — JWT signing secret, required, at least 32 bytes
   (e.g. `openssl rand -hex 32`); the server refuses to start without it
+- `COLLECTA_DATA_DIR` — root for attachment blobs (default `./collecta-data`)
+- `COLLECTA_BASE_URL` — absolute origin advertised in OpenRosa `downloadUrl`s
+  (e.g. `https://collect.example.org`). Unset, it is derived from each request's
+  `Host`, which is fine directly on the internet but wrong behind a proxy that
+  rewrites it.
 
 ---
 
