@@ -8,8 +8,8 @@ use collecta_core::form::{Form, FormField};
 use collecta_core::submission::{FieldValue, Submission};
 use collecta_core::sync_protocol::{FormsPullResponse, PushItemStatus, PushRequest, PushResponse};
 use collecta_server::auth::{Claims, TokenResponse, hash_password};
-use collecta_server::router;
 use collecta_server::store::{Store, UserRecord};
+use collecta_server::{Config, router};
 use rust_xlsxwriter::Workbook;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -35,9 +35,17 @@ async fn seeded_store(db_path: &str) -> Store {
     store
 }
 
+/// Config for the json-api tests, whose handlers never touch the data dir.
+fn test_config() -> Config {
+    Config::new(
+        TEST_SECRET,
+        std::env::temp_dir().join("collecta-tests-unused"),
+    )
+}
+
 /// In-memory app with one seeded admin, plus a token from a real login.
 async fn test_app() -> (axum::Router, String) {
-    let app = router(seeded_store(":memory:").await, TEST_SECRET);
+    let app = router(seeded_store(":memory:").await, test_config());
     let token = login(&app, TEST_EMAIL, TEST_PASSWORD).await;
     (app, token)
 }
@@ -385,7 +393,7 @@ async fn sync_forms_cursor_tiebreaks_identical_timestamps() {
         .await
         .unwrap();
 
-    let app = router(store, TEST_SECRET);
+    let app = router(store, test_config());
     let token = login(&app, TEST_EMAIL, TEST_PASSWORD).await;
 
     // a client holding the cursor for form_a must still be given form_b.

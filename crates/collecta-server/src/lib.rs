@@ -6,10 +6,15 @@
 //! All data endpoints require a bearer JWT issued by `POST /api/v1/auth/login`;
 //! only `/health` and login itself are public. Users are admin-seeded via the
 //! `create-user` CLI subcommand, there is no signup endpoint.
+//!
+//! [`openrosa`] adds a second, Basic-authenticated surface at the server root
+//! for ODK Collect. The two share the users table and nothing else.
 
 pub mod auth;
+pub mod openrosa;
 pub mod store;
 
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 use axum::Router;
@@ -31,25 +36,52 @@ use collecta_core::validation;
 
 use store::Store;
 
-/// Shared handler state: the store plus the JWT signing secret.
+/// Server settings that are not the database.
+pub struct Config {
+    /// HS256 signing secret for the JSON API's JWTs. Must be 32+ bytes.
+    pub jwt_secret: String,
+    /// Root for server-written blobs; OpenRosa attachments live under it.
+    pub data_dir: PathBuf,
+    /// Absolute origin to advertise in OpenRosa `downloadUrl`s. When unset the
+    /// URL is derived from each request.
+    pub base_url: Option<String>,
+}
+
+impl Config {
+    /// Config with a throwaway data directory, for tests and for callers that
+    /// do not use the OpenRosa routes.
+    pub fn new(jwt_secret: impl Into<String>, data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            jwt_secret: jwt_secret.into(),
+            data_dir: data_dir.into(),
+            base_url: None,
+        }
+    }
+}
+
+/// Shared handler state: the store, the JWT signing secret, and where blobs go.
 #[derive(Clone)]
 pub struct AppState {
     pub store: Store,
     pub jwt_secret: Arc<str>,
+    pub data_dir: Arc<FsPath>,
+    pub base_url: Option<Arc<str>>,
 }
 
 /// Build the router over an already-open [`Store`].
 ///
-/// Panics if `jwt_secret` is shorter than 32 bytes: HS256 with a short
+/// Panics if the JWT secret is shorter than 32 bytes: HS256 with a short
 /// secret is brute-forceable, and this is the single construction path.
-pub fn router(store: Store, jwt_secret: &str) -> Router {
+pub fn router(store: Store, config: Config) -> Router {
     assert!(
-        jwt_secret.len() >= 32,
+        config.jwt_secret.len() >= 32,
         "jwt secret must be at least 32 bytes"
     );
     let state = AppState {
         store,
-        jwt_secret: Arc::from(jwt_secret),
+        jwt_secret: Arc::from(config.jwt_secret.as_str()),
+        data_dir: Arc::from(config.data_dir.as_path()),
+        base_url: config.base_url.as_deref().map(Arc::from),
     };
     let protected = Router::new()
         .route("/api/v1/forms", get(list_forms).post(create_form))
@@ -70,16 +102,28 @@ pub fn router(store: Store, jwt_secret: &str) -> Router {
         .route("/health", get(health))
         .route("/api/v1/auth/login", post(auth::login))
         .merge(protected)
+        .merge(openrosa::router(state.clone()))
         .with_state(state)
 }
 
 /// Build the router, opening the database at `$COLLECTA_DB` (default
 /// `./collecta.db`) and signing tokens with `$COLLECTA_JWT_SECRET` (required).
 pub async fn app() -> Router {
-    let jwt_secret = std::env::var("COLLECTA_JWT_SECRET")
-        .expect("COLLECTA_JWT_SECRET must be set (32+ random bytes)");
     let store = open_store().await;
-    router(store, &jwt_secret)
+    router(store, config_from_env())
+}
+
+/// Read [`Config`] from the environment. Panics when the JWT secret is absent:
+/// there is no unauthenticated fallback mode.
+pub fn config_from_env() -> Config {
+    Config {
+        jwt_secret: std::env::var("COLLECTA_JWT_SECRET")
+            .expect("COLLECTA_JWT_SECRET must be set (32+ random bytes)"),
+        data_dir: std::env::var("COLLECTA_DATA_DIR")
+            .unwrap_or_else(|_| "./collecta-data".to_string())
+            .into(),
+        base_url: std::env::var("COLLECTA_BASE_URL").ok(),
+    }
 }
 
 /// Open the database at `$COLLECTA_DB` (default `./collecta.db`).

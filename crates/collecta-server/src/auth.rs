@@ -14,6 +14,8 @@ use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{Json, Response};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 
@@ -103,6 +105,61 @@ pub async fn require_auth(
     let claims = extract_claims(&request, &state.jwt_secret)?;
     request.extensions_mut().insert(claims);
     Ok(next.run(request).await)
+}
+
+/// Realm advertised to ODK Collect in the Basic challenge.
+pub const BASIC_REALM: &str = "collecta";
+
+/// The `WWW-Authenticate` challenge for the OpenRosa routes.
+///
+/// ODK Collect probes unauthenticated first and only sends credentials after
+/// seeing this header, so every rejection on those routes must carry it.
+pub const BASIC_CHALLENGE: &str = r#"Basic realm="collecta", charset="UTF-8""#;
+
+/// Credentials parsed out of an `Authorization: Basic` header.
+pub struct BasicCredentials {
+    pub user_id: String,
+    pub password: String,
+}
+
+/// Parse RFC 7617 Basic credentials.
+///
+/// The scheme token is case-insensitive, the payload must be canonical padded
+/// standard base64 decoding to utf-8, and the split is on the *first* colon:
+/// user-ids cannot contain one, passwords can.
+pub fn parse_basic_header(header: &str) -> Option<BasicCredentials> {
+    let (scheme, payload) = header.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    // RFC 7235 allows only spaces here, but tolerate extra whitespace rather
+    // than reject a client over framing.
+    let payload = payload.trim();
+    let decoded = BASE64_STANDARD.decode(payload).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (user_id, password) = decoded.split_once(':')?;
+    Some(BasicCredentials {
+        user_id: user_id.to_string(),
+        password: password.to_string(),
+    })
+}
+
+/// Verify Basic credentials against the users table.
+///
+/// An unknown user is still run through an argon2 verification so a missing
+/// account and a wrong password take the same time, matching [`login`].
+pub async fn verify_basic(
+    store: &crate::store::Store,
+    credentials: &BasicCredentials,
+) -> Result<Option<UserRecord>, sqlx::Error> {
+    let Some(user) = store.get_user_by_email(&credentials.user_id).await? else {
+        let _ = verify_password(&credentials.password, &DUMMY_HASH);
+        return Ok(None);
+    };
+    if !verify_password(&credentials.password, &user.password_hash) {
+        return Ok(None);
+    }
+    Ok(Some(user))
 }
 
 /// `POST /api/v1/auth/login` — verify credentials, issue a JWT.

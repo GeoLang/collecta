@@ -5,7 +5,7 @@
 //! is a file created on first open.
 
 use collecta_core::form::Form;
-use collecta_core::submission::Submission;
+use collecta_core::submission::{AttachmentRef, Submission};
 use collecta_core::sync_queue::{QueueItem, SyncStatus};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -27,6 +27,28 @@ pub struct SyncCounts {
     pub failed: usize,
     pub abandoned: usize,
     pub total: usize,
+}
+
+/// A stored attachment. `storage_path` is server-generated; no part of it comes
+/// from the client (see [`crate::openrosa`]).
+#[derive(Debug, Clone)]
+pub struct AttachmentRow {
+    pub id: Uuid,
+    pub submission_id: Uuid,
+    pub field_name: String,
+    /// Client-supplied name, kept as metadata only.
+    pub filename: String,
+    pub content_type: String,
+    pub size_bytes: u64,
+    pub storage_path: String,
+}
+
+/// Result of claiming a `meta/instanceID` for a form.
+pub enum InstanceInsert {
+    /// The instance was new; this is its submission id.
+    Created(Uuid),
+    /// That instance id was already taken, by this submission.
+    Existing(Submission),
 }
 
 /// A stored user. Internal to the server: carries the password hash and is
@@ -87,30 +109,63 @@ impl Store {
                 role TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )",
+            "CREATE TABLE IF NOT EXISTS attachments (
+                id TEXT PRIMARY KEY,
+                submission_id TEXT NOT NULL,
+                field_name TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                storage_path TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS attachments_submission
+                ON attachments (submission_id)",
         ] {
             sqlx::query(ddl).execute(&self.pool).await?;
         }
-        self.migrate_forms_updated_at().await
+        self.migrate_forms_updated_at().await?;
+        self.migrate_submissions_instance_id().await
+    }
+
+    // sqlite has no `ADD COLUMN IF NOT EXISTS`: run it and swallow only the
+    // duplicate-column error, so a fresh and an upgraded database converge.
+    async fn add_column(&self, ddl: &'static str) -> Result<(), sqlx::Error> {
+        match sqlx::query(ddl).execute(&self.pool).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let duplicate = e
+                    .as_database_error()
+                    .is_some_and(|db| db.message().contains("duplicate column name"));
+                if duplicate { Ok(()) } else { Err(e) }
+            }
+        }
     }
 
     // databases created before the sync protocol lack forms.updated_at:
     // add it and backfill so existing forms are visible to a fresh cursor.
     async fn migrate_forms_updated_at(&self) -> Result<(), sqlx::Error> {
-        let add = sqlx::query("ALTER TABLE forms ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
-            .execute(&self.pool)
-            .await;
-        if let Err(e) = add {
-            let duplicate = e
-                .as_database_error()
-                .is_some_and(|db| db.message().contains("duplicate column name"));
-            if !duplicate {
-                return Err(e);
-            }
-        }
+        self.add_column("ALTER TABLE forms ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+            .await?;
         sqlx::query("UPDATE forms SET updated_at = ? WHERE updated_at = ''")
             .bind(timestamp_now())
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    // openrosa submissions carry a client-generated meta/instanceID used as the
+    // idempotency key. The index is partial so rows from the json api, which
+    // have no instance id, are not forced into a single '' collision.
+    async fn migrate_submissions_instance_id(&self) -> Result<(), sqlx::Error> {
+        self.add_column("ALTER TABLE submissions ADD COLUMN instance_id TEXT NOT NULL DEFAULT ''")
+            .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS submissions_form_instance
+             ON submissions (form_id, instance_id) WHERE instance_id != ''",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -224,6 +279,113 @@ impl Store {
         Ok(inserted)
     }
 
+    /// Persist an openrosa submission under its `meta/instanceID`, or report the
+    /// submission that already claims that id for this form.
+    ///
+    /// The insert races the unique index rather than checking first, so two
+    /// concurrent posts of the same instance cannot both be accepted.
+    pub async fn insert_instance(
+        &self,
+        submission: &Submission,
+        instance_id: &str,
+    ) -> Result<InstanceInsert, sqlx::Error> {
+        let insert = sqlx::query(
+            "INSERT INTO submissions (id, form_id, data, instance_id) VALUES (?, ?, ?, ?)",
+        )
+        .bind(submission.id.to_string())
+        .bind(submission.form_id.to_string())
+        .bind(encode_json(submission))
+        .bind(instance_id)
+        .execute(&self.pool)
+        .await;
+
+        match insert {
+            Ok(_) => {
+                self.enqueue(submission).await?;
+                Ok(InstanceInsert::Created(submission.id))
+            }
+            Err(e) if is_unique_violation(&e) => {
+                let existing = self
+                    .find_instance(submission.form_id, instance_id)
+                    .await?
+                    .ok_or(e)?;
+                Ok(InstanceInsert::Existing(existing))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The submission holding `instance_id` for `form_id`, if any.
+    pub async fn find_instance(
+        &self,
+        form_id: Uuid,
+        instance_id: &str,
+    ) -> Result<Option<Submission>, sqlx::Error> {
+        let row = sqlx::query("SELECT data FROM submissions WHERE form_id = ? AND instance_id = ?")
+            .bind(form_id.to_string())
+            .bind(instance_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.as_ref().map(row_json))
+    }
+
+    /// Record an attachment and mirror it onto the submission's own list.
+    ///
+    /// Read-modify-write of the submission json runs in a transaction so two
+    /// attachments landing at once cannot drop one another.
+    pub async fn add_attachment(&self, attachment: &AttachmentRow) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO attachments
+             (id, submission_id, field_name, filename, content_type, size_bytes, storage_path, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(attachment.id.to_string())
+        .bind(attachment.submission_id.to_string())
+        .bind(&attachment.field_name)
+        .bind(&attachment.filename)
+        .bind(&attachment.content_type)
+        .bind(attachment.size_bytes as i64)
+        .bind(&attachment.storage_path)
+        .bind(timestamp_now())
+        .execute(&mut *tx)
+        .await?;
+
+        let row = sqlx::query("SELECT data FROM submissions WHERE id = ?")
+            .bind(attachment.submission_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+        if let Some(row) = row {
+            let mut submission: Submission = row_json(&row);
+            submission.attachments.push(AttachmentRef {
+                id: attachment.id,
+                field_name: attachment.field_name.clone(),
+                filename: attachment.filename.clone(),
+                mime_type: attachment.content_type.clone(),
+                size_bytes: attachment.size_bytes,
+            });
+            sqlx::query("UPDATE submissions SET data = ? WHERE id = ?")
+                .bind(encode_json(&submission))
+                .bind(attachment.submission_id.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await
+    }
+
+    /// Field names already attached to a submission, for skipping parts ODK
+    /// resends when it splits one submission across several posts.
+    pub async fn attached_field_names(
+        &self,
+        submission_id: Uuid,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let rows = sqlx::query("SELECT field_name FROM attachments WHERE submission_id = ?")
+            .bind(submission_id.to_string())
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(|row| row.get("field_name")).collect())
+    }
+
     pub async fn create_user(&self, user: &UserRecord) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO users (id, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -301,6 +463,11 @@ fn format_cursor(row: &sqlx::sqlite::SqliteRow) -> String {
     let updated_at: String = row.get("updated_at");
     let rowid: i64 = row.get("rowid");
     format!("{updated_at}@{rowid}")
+}
+
+fn is_unique_violation(e: &sqlx::Error) -> bool {
+    e.as_database_error()
+        .is_some_and(|db| db.is_unique_violation())
 }
 
 fn status_label(status: SyncStatus) -> &'static str {
