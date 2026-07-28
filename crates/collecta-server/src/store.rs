@@ -395,17 +395,49 @@ impl Store {
         tx.commit().await
     }
 
-    /// Field names already attached to a submission, for skipping parts ODK
+    /// File names already attached to a submission, for skipping parts ODK
     /// resends when it splits one submission across several posts.
-    pub async fn attached_field_names(
+    pub async fn attached_filenames(
         &self,
         submission_id: Uuid,
     ) -> Result<Vec<String>, sqlx::Error> {
-        let rows = sqlx::query("SELECT field_name FROM attachments WHERE submission_id = ?")
+        let rows = sqlx::query("SELECT filename FROM attachments WHERE submission_id = ?")
             .bind(submission_id.to_string())
             .fetch_all(&self.pool)
             .await?;
-        Ok(rows.iter().map(|row| row.get("field_name")).collect())
+        Ok(rows.iter().map(|row| row.get("filename")).collect())
+    }
+
+    /// Attachments recorded for a submission, oldest first.
+    pub async fn list_attachments(
+        &self,
+        submission_id: Uuid,
+    ) -> Result<Vec<AttachmentRow>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT id, submission_id, field_name, filename, content_type, size_bytes, storage_path
+             FROM attachments WHERE submission_id = ? ORDER BY rowid",
+        )
+        .bind(submission_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let id: String = row.get("id");
+                let submission_id: String = row.get("submission_id");
+                AttachmentRow {
+                    id: id.parse().expect("stored attachment id is a uuid"),
+                    submission_id: submission_id
+                        .parse()
+                        .expect("stored submission id is a uuid"),
+                    field_name: row.get("field_name"),
+                    filename: row.get("filename"),
+                    content_type: row.get("content_type"),
+                    size_bytes: row.get::<i64, _>("size_bytes") as u64,
+                    storage_path: row.get("storage_path"),
+                }
+            })
+            .collect())
     }
 
     pub async fn create_user(&self, user: &UserRecord) -> Result<(), sqlx::Error> {

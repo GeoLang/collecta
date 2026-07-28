@@ -5,18 +5,24 @@
 //! each time. `meta/instanceID` is therefore the idempotency key: the first POST
 //! creates the submission, later ones only add attachment parts.
 
+use std::collections::HashMap;
+
 use axum::Extension;
 use axum::extract::{Multipart, State, multipart::Field};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use sha2::{Digest, Sha256};
+use tokio::fs;
+use uuid::Uuid;
 
+use collecta_core::form::{FieldType, Form};
+use collecta_core::submission::{FieldValue, Submission};
 use collecta_core::validation;
 
 use super::instance;
 use super::{MAX_CONTENT_LENGTH, OpenRosaError, OpenRosaUser, envelope, error, xml_headers};
 use crate::AppState;
-use crate::store::InstanceInsert;
+use crate::store::{AttachmentRow, InstanceInsert};
 
 /// The multipart part carrying the instance XML.
 const INSTANCE_PART: &str = "xml_submission_file";
@@ -116,7 +122,8 @@ pub async fn submit(
         }
     };
 
-    let stored = store_attachments(&state, submission_id, &attachments).await?;
+    let filenames = field_by_filename(&form, &submission);
+    let stored = store_attachments(&state, submission_id, &attachments, &filenames).await?;
 
     let message = if resubmission {
         format!("attachments received ({stored} new)")
@@ -200,13 +207,94 @@ async fn read_capped(mut field: Field<'_>) -> Result<Vec<u8>, OpenRosaError> {
     Ok(bytes)
 }
 
-/// Persisting attachment bytes lands in the next milestone.
+/// Write attachment bytes to disk and record them.
+///
+/// # Path construction
+///
+/// The storage path is `<data_dir>/attachments/<submission uuid>/<attachment
+/// uuid>`. Both components are [`Uuid`]s this server generated, so the path is
+/// traversal-proof by construction rather than by sanitising: no client-supplied
+/// string is ever a path component. The client's file name is recorded in the
+/// `filename` column and used only for matching resent parts.
 async fn store_attachments(
-    _state: &AppState,
-    _submission_id: uuid::Uuid,
+    state: &AppState,
+    submission_id: Uuid,
     attachments: &[AttachmentPart],
+    field_by_filename: &HashMap<String, String>,
 ) -> Result<usize, OpenRosaError> {
-    Ok(attachments.len())
+    if attachments.is_empty() {
+        return Ok(0);
+    }
+
+    let already_stored = state.store.attached_filenames(submission_id).await?;
+    let directory = super::attachments_dir(&state.data_dir).join(submission_id.to_string());
+    fs::create_dir_all(&directory)
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "cannot store attachment"))?;
+
+    let mut stored = 0;
+    for attachment in attachments {
+        // ODK names the part after the file the instance refers to; some
+        // clients put that in the filename instead.
+        let client_name = attachment
+            .filename
+            .clone()
+            .unwrap_or_else(|| attachment.name.clone());
+        // a later post in the same series resends parts it already delivered.
+        if already_stored.contains(&client_name) {
+            continue;
+        }
+
+        let id = Uuid::new_v4();
+        let path = directory.join(id.to_string());
+        fs::write(&path, &attachment.bytes)
+            .await
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "cannot store attachment"))?;
+
+        let field_name = field_by_filename
+            .get(&attachment.name)
+            .or_else(|| field_by_filename.get(&client_name))
+            .cloned()
+            .unwrap_or_default();
+
+        state
+            .store
+            .add_attachment(&AttachmentRow {
+                id,
+                submission_id,
+                field_name,
+                filename: client_name,
+                content_type: attachment.content_type.clone(),
+                size_bytes: attachment.bytes.len() as u64,
+                storage_path: path.to_string_lossy().into_owned(),
+            })
+            .await?;
+        stored += 1;
+    }
+    Ok(stored)
+}
+
+/// Map each binary field's stored file name back to its field, so an
+/// attachment part can be attributed to the question that captured it.
+fn field_by_filename(form: &Form, submission: &Submission) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for field in &form.fields {
+        let binary = matches!(
+            field.field_type,
+            FieldType::Photo
+                | FieldType::Audio
+                | FieldType::Video
+                | FieldType::File
+                | FieldType::Signature
+        );
+        if !binary {
+            continue;
+        }
+        if let Some(FieldValue::Text(filename)) = submission.values.get(&field.name) {
+            map.insert(filename.clone(), field.name.clone());
+        }
+    }
+    map
 }
 
 /// Content hash used to tell a genuine resubmission from an instanceID

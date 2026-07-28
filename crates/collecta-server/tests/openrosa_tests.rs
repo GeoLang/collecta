@@ -835,6 +835,227 @@ async fn submission_requires_basic_auth() {
     assert!(store.list_submissions(form.id).await.unwrap().is_empty());
 }
 
+// ---- attachments -------------------------------------------------------
+
+#[tokio::test]
+async fn attachments_are_written_and_linked_to_their_field() {
+    let (app, form, store, dir) = app_parts_with_dir().await;
+
+    let xml = instance_xml(
+        form.id,
+        "uuid:aaaa1111-0000-0000-0000-000000000001",
+        "<q_text>Alpha</q_text><q_photo>photo1.jpg</q_photo>",
+    );
+    let resp = post_submission(
+        &app,
+        &[
+            instance_part(&xml),
+            part(
+                "photo1.jpg",
+                Some("photo1.jpg"),
+                "image/jpeg",
+                b"JPEGBYTES".to_vec(),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let stored = store.list_submissions(form.id).await.unwrap();
+    let attachments = store.list_attachments(stored[0].id).await.unwrap();
+    assert_eq!(attachments.len(), 1);
+
+    let attachment = &attachments[0];
+    assert_eq!(attachment.filename, "photo1.jpg");
+    assert_eq!(attachment.content_type, "image/jpeg");
+    assert_eq!(attachment.size_bytes, 9);
+    // the part is attributed to the question whose value names that file.
+    assert_eq!(attachment.field_name, "q_photo");
+
+    // the bytes really landed on disk, under the configured data directory.
+    let path = std::path::Path::new(&attachment.storage_path);
+    assert_eq!(std::fs::read(path).unwrap(), b"JPEGBYTES");
+    assert!(
+        path.starts_with(dir.path()),
+        "{path:?} escaped the data directory"
+    );
+    // the stored path is built from uuids only, never the client's name.
+    assert_eq!(
+        path.file_name().unwrap().to_str().unwrap(),
+        attachment.id.to_string()
+    );
+    assert!(!attachment.storage_path.contains("photo1.jpg"));
+
+    // and the submission itself references it.
+    let stored = store.list_submissions(form.id).await.unwrap();
+    assert_eq!(stored[0].attachments.len(), 1);
+    assert_eq!(stored[0].attachments[0].filename, "photo1.jpg");
+}
+
+#[tokio::test]
+async fn hostile_attachment_names_cannot_escape_the_data_directory() {
+    let (app, form, store, dir) = app_parts_with_dir().await;
+
+    let hostile = [
+        "../../../../../../tmp/collecta-pwned",
+        "..\\..\\..\\windows\\system32\\evil",
+        "/etc/cron.d/collecta",
+        "....//....//escape",
+        "a/../../b",
+        ".",
+        "..",
+        "",
+    ];
+
+    let mut parts = vec![instance_part(&instance_xml(
+        form.id,
+        "uuid:aaaa1111-0000-0000-0000-000000000002",
+        "<q_text>Alpha</q_text>",
+    ))];
+    for (index, name) in hostile.iter().enumerate() {
+        parts.push(part(
+            name,
+            Some(name),
+            "application/octet-stream",
+            format!("payload{index}").into_bytes(),
+        ));
+    }
+
+    let resp = post_submission(&app, &parts).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let stored = store.list_submissions(form.id).await.unwrap();
+    let attachments = store.list_attachments(stored[0].id).await.unwrap();
+
+    for attachment in &attachments {
+        let path = std::path::Path::new(&attachment.storage_path);
+        // every stored file sits directly under <data>/attachments/<sub>/.
+        assert!(
+            path.starts_with(dir.path()),
+            "{path:?} escaped the data directory"
+        );
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            attachment.id.to_string(),
+            "the file name must be a server-generated uuid"
+        );
+        assert!(std::fs::read(path).is_ok(), "{path:?} should exist");
+    }
+
+    // nothing was written outside the data directory.
+    assert!(!std::path::Path::new("/tmp/collecta-pwned").exists());
+}
+
+#[tokio::test]
+async fn resent_attachment_parts_are_not_duplicated() {
+    let (app, form, store, _dir) = app_parts_with_dir().await;
+    let instance_id = "uuid:aaaa1111-0000-0000-0000-000000000003";
+    let xml = instance_xml(
+        form.id,
+        instance_id,
+        "<q_text>Alpha</q_text><q_photo>photo1.jpg</q_photo>",
+    );
+
+    // odk splits a large submission into several posts, repeating the instance
+    // and, on a retry, sometimes a part it already delivered.
+    let photo = || {
+        part(
+            "photo1.jpg",
+            Some("photo1.jpg"),
+            "image/jpeg",
+            b"A".to_vec(),
+        )
+    };
+    let audio = || part("clip.m4a", Some("clip.m4a"), "audio/mp4", b"B".to_vec());
+
+    assert_eq!(
+        post_submission(&app, &[instance_part(&xml), photo()])
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        post_submission(&app, &[instance_part(&xml), audio()])
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    // a full retry of the first post.
+    assert_eq!(
+        post_submission(&app, &[instance_part(&xml), photo()])
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+
+    let stored = store.list_submissions(form.id).await.unwrap();
+    assert_eq!(stored.len(), 1, "still one submission");
+    let attachments = store.list_attachments(stored[0].id).await.unwrap();
+    assert_eq!(attachments.len(), 2, "one row per distinct file");
+    let names: Vec<&str> = attachments.iter().map(|a| a.filename.as_str()).collect();
+    assert!(names.contains(&"photo1.jpg") && names.contains(&"clip.m4a"));
+}
+
+#[tokio::test]
+async fn oversized_parts_are_refused_rather_than_stored() {
+    let (app, form, store, _dir) = app_parts_with_dir().await;
+    let xml = instance_xml(
+        form.id,
+        "uuid:aaaa1111-0000-0000-0000-000000000004",
+        "<q_text>Alpha</q_text>",
+    );
+
+    // one part past the advertised accepted length.
+    let huge = vec![b'x'; collecta_server::openrosa::MAX_CONTENT_LENGTH + 1];
+    let resp = post_submission(
+        &app,
+        &[
+            instance_part(&xml),
+            part("big.bin", Some("big.bin"), "application/octet-stream", huge),
+        ],
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "an oversized body must be refused, not 500"
+    );
+
+    // nothing was stored, and the error is still an openrosa envelope.
+    assert!(store.list_submissions(form.id).await.unwrap().is_empty());
+    let doc = parse(&body_string(resp).await);
+    assert_eq!(doc.first().unwrap().name, "OpenRosaResponse");
+}
+
+#[tokio::test]
+async fn attachments_above_the_default_body_limit_are_accepted() {
+    let (app, form, store, _dir) = app_parts_with_dir().await;
+    let xml = instance_xml(
+        form.id,
+        "uuid:aaaa1111-0000-0000-0000-000000000005",
+        "<q_text>Alpha</q_text><q_photo>big.jpg</q_photo>",
+    );
+
+    // axum's default body limit is 2 MiB. A 4 MiB photo proves the submission
+    // route really raised it to the advertised length, rather than the earlier
+    // oversize test tripping the default.
+    let size = 4 * 1024 * 1024;
+    let resp = post_submission(
+        &app,
+        &[
+            instance_part(&xml),
+            part("big.jpg", Some("big.jpg"), "image/jpeg", vec![b'x'; size]),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let stored = store.list_submissions(form.id).await.unwrap();
+    let attachments = store.list_attachments(stored[0].id).await.unwrap();
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0].size_bytes, size as u64);
+}
+
 // ---- fixtures ----------------------------------------------------------
 
 fn kitchen_sink_form() -> Form {
@@ -887,9 +1108,17 @@ async fn app_with_form() -> (axum::Router, Form) {
     (app, form)
 }
 
-/// The router plus a direct handle on the store, so tests can assert on what
-/// was actually persisted rather than on the response alone.
 async fn app_parts() -> (axum::Router, Form, Store) {
+    let (app, form, store, dir) = app_parts_with_dir().await;
+    // the json-api assertions never look at disk; keep the directory alive for
+    // the duration of the test anyway.
+    std::mem::forget(dir);
+    (app, form, store)
+}
+
+/// The router plus a direct handle on the store and the data directory, so
+/// tests can assert on what was actually persisted rather than on the response.
+async fn app_parts_with_dir() -> (axum::Router, Form, Store, tempfile::TempDir) {
     let store = Store::connect(":memory:").await.unwrap();
     store
         .create_user(&UserRecord {
@@ -903,10 +1132,10 @@ async fn app_parts() -> (axum::Router, Form, Store) {
     let form = kitchen_sink_form();
     store.insert_form(&form).await.unwrap();
 
-    let dir = std::env::temp_dir().join(format!("collecta-or-{}", Uuid::new_v4()));
-    let mut config = Config::new(TEST_SECRET, &dir);
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::new(TEST_SECRET, dir.path());
     config.base_url = Some("http://collecta.test".to_string());
-    (router(store.clone(), config), form, store)
+    (router(store.clone(), config), form, store, dir)
 }
 
 fn authed(method: &str, uri: &str, email: &str, password: &str) -> Request<Body> {
