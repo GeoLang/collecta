@@ -10,17 +10,19 @@
 //! Collect uses those headers to decide it is talking to an OpenRosa server
 //! rather than a captive portal.
 
+pub mod instance;
+pub mod submission;
 pub mod xform;
 
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::header::{CONTENT_TYPE, DATE, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -50,6 +52,14 @@ pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/formList", get(form_list))
         .route("/forms/{form_id}/form.xml", get(download_form))
+        .route(
+            "/submission",
+            post(submission::submit)
+                .head(submission::probe)
+                // enforced by the extractor, so an oversized body is refused
+                // while streaming rather than after being buffered.
+                .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY)),
+        )
         .route_layer(middleware::from_fn_with_state(state, require_basic))
         // outside the auth layer so the 401 challenge is tagged too.
         .layer(middleware::from_fn(openrosa_headers))

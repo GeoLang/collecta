@@ -9,6 +9,7 @@ use axum::response::Response;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use collecta_core::form::{Choice, FieldType, Form, FormField};
+use collecta_core::submission::{FieldValue, GeoPoint};
 use collecta_server::openrosa::xform;
 use collecta_server::store::{Store, UserRecord};
 use collecta_server::{Config, router};
@@ -427,6 +428,413 @@ async fn jwt_api_is_unaffected_by_the_openrosa_routes() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+// ---- submission --------------------------------------------------------
+
+#[tokio::test]
+async fn head_probe_returns_204_with_the_accepted_length() {
+    let (app, _form, _store) = app_parts().await;
+
+    let resp = app
+        .clone()
+        .oneshot(authed("HEAD", "/submission", TEST_EMAIL, TEST_PASSWORD))
+        .await
+        .unwrap();
+    // collect requires exactly 204 here, not 200.
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(resp.headers().get("x-openrosa-version").unwrap(), "1.0");
+    assert_eq!(
+        resp.headers()
+            .get("x-openrosa-accept-content-length")
+            .unwrap(),
+        "52428800"
+    );
+
+    // the probe is authenticated, and an unauthenticated one gets the
+    // challenge rather than a 500.
+    let resp = app
+        .oneshot(Request::head("/submission").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(resp.headers().get("www-authenticate").is_some());
+}
+
+#[tokio::test]
+async fn submission_becomes_typed_field_values() {
+    let (app, form, store) = app_parts().await;
+
+    let xml = instance_xml(
+        form.id,
+        "uuid:11111111-1111-1111-1111-111111111111",
+        r#"<q_text>Alpha Site</q_text>
+  <q_integer>42</q_integer>
+  <q_decimal>3.5</q_decimal>
+  <q_date>2026-07-28</q_date>
+  <q_geopoint>51.5 -0.12 35.0 4.2</q_geopoint>
+  <q_geotrace>51.5 -0.12 0 0; 51.6 -0.13 0 0</q_geotrace>
+  <q_barcode>ABC-123</q_barcode>
+  <q_photo>1553025782376.jpg</q_photo>
+  <q_select>a</q_select>
+  <q_multiselect>a b</q_multiselect>"#,
+    );
+
+    let resp = post_submission(&app, &[instance_part(&xml)]).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "text/xml; charset=utf-8"
+    );
+
+    // the success body is a parseable OpenRosaResponse.
+    let body = body_string(resp).await;
+    let doc = parse(&body);
+    assert_eq!(doc.first().unwrap().name, "OpenRosaResponse");
+    assert_eq!(
+        doc.first().unwrap().attr("xmlns").as_deref(),
+        Some("http://openrosa.org/http/response")
+    );
+    assert!(doc.find("message").is_some());
+
+    let stored = store.list_submissions(form.id).await.unwrap();
+    assert_eq!(stored.len(), 1);
+    let values = &stored[0].values;
+
+    assert_eq!(
+        values.get("q_text"),
+        Some(&FieldValue::Text("Alpha Site".into()))
+    );
+    assert_eq!(values.get("q_integer"), Some(&FieldValue::Integer(42)));
+    assert_eq!(values.get("q_decimal"), Some(&FieldValue::Decimal(3.5)));
+    assert_eq!(
+        values.get("q_date"),
+        Some(&FieldValue::Date("2026-07-28".into()))
+    );
+    assert_eq!(
+        values.get("q_geopoint"),
+        Some(&FieldValue::GeoPoint(GeoPoint {
+            latitude: 51.5,
+            longitude: -0.12,
+            altitude: Some(35.0),
+            accuracy: Some(4.2),
+        }))
+    );
+    match values.get("q_geotrace") {
+        Some(FieldValue::GeoTrace(points)) => assert_eq!(points.len(), 2),
+        other => panic!("expected a geotrace, got {other:?}"),
+    }
+    assert_eq!(
+        values.get("q_barcode"),
+        Some(&FieldValue::Barcode("ABC-123".into()))
+    );
+    assert_eq!(
+        values.get("q_select"),
+        Some(&FieldValue::Choice("a".into()))
+    );
+    assert_eq!(
+        values.get("q_multiselect"),
+        Some(&FieldValue::MultiChoice(vec!["a".into(), "b".into()]))
+    );
+    // a binary node holds the file name the attachment part will be keyed by.
+    assert_eq!(
+        values.get("q_photo"),
+        Some(&FieldValue::Text("1553025782376.jpg".into()))
+    );
+    // the authenticated user is recorded, not anything the client claimed.
+    assert!(stored[0].collector_id.is_some());
+}
+
+#[tokio::test]
+async fn repeated_post_of_one_instance_id_stores_one_submission() {
+    let (app, form, store) = app_parts().await;
+    let xml = minimal_instance(form.id, "uuid:22222222-2222-2222-2222-222222222222");
+
+    // collect resends the identical instance with each attachment batch.
+    for attempt in 0..3 {
+        let resp = post_submission(&app, &[instance_part(&xml)]).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "attempt {attempt} must report success so collect stops retrying"
+        );
+    }
+
+    let stored = store.list_submissions(form.id).await.unwrap();
+    assert_eq!(stored.len(), 1, "instanceID is the idempotency key");
+}
+
+#[tokio::test]
+async fn instance_id_reused_with_different_xml_conflicts() {
+    let (app, form, store) = app_parts().await;
+    let instance_id = "uuid:33333333-3333-3333-3333-333333333333";
+
+    let first = instance_xml(form.id, instance_id, "<q_text>Original</q_text>");
+    assert_eq!(
+        post_submission(&app, &[instance_part(&first)])
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+
+    // same key, different content: this is a collision, not a resubmission,
+    // and must never overwrite what is already filed.
+    let tampered = instance_xml(form.id, instance_id, "<q_text>Tampered</q_text>");
+    let resp = post_submission(&app, &[instance_part(&tampered)]).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    let stored = store.list_submissions(form.id).await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(
+        stored[0].values.get("q_text"),
+        Some(&FieldValue::Text("Original".into())),
+        "the stored submission must be untouched"
+    );
+}
+
+#[tokio::test]
+async fn another_user_cannot_extend_someone_elses_instance() {
+    let (app, form, store) = app_parts().await;
+    store
+        .create_user(&UserRecord {
+            id: Uuid::new_v4(),
+            email: "intruder@example.com".to_string(),
+            password_hash: collecta_server::auth::hash_password(TEST_PASSWORD),
+            role: "collector".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let instance_id = "uuid:44444444-4444-4444-4444-444444444444";
+    let xml = minimal_instance(form.id, instance_id);
+    assert_eq!(
+        post_submission(&app, &[instance_part(&xml)]).await.status(),
+        StatusCode::CREATED
+    );
+
+    // byte-identical xml, so the content check passes; ownership is what stops
+    // an observed instanceID being used to graft files onto another record.
+    let resp = app
+        .oneshot(multipart_request(
+            "/submission",
+            "intruder@example.com",
+            TEST_PASSWORD,
+            &[instance_part(&xml)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    assert_eq!(store.list_submissions(form.id).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn submissions_without_an_instance_id_are_rejected() {
+    let (app, form, store) = app_parts().await;
+
+    let no_meta = format!(
+        r#"<?xml version="1.0"?><data id="{}" version="1"><q_text>x</q_text></data>"#,
+        form.id
+    );
+    let empty_meta = format!(
+        r#"<?xml version="1.0"?><data id="{}" version="1"><q_text>x</q_text>
+        <meta xmlns="http://openrosa.org/xforms"><instanceID></instanceID></meta></data>"#,
+        form.id
+    );
+
+    for xml in [no_meta, empty_meta] {
+        let resp = post_submission(&app, &[instance_part(&xml)]).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // the message reaches the user through the envelope.
+        let doc = parse(&body_string(resp).await);
+        assert_eq!(doc.first().unwrap().name, "OpenRosaResponse");
+    }
+    assert!(store.list_submissions(form.id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn malformed_posts_are_rejected_not_crashed() {
+    let (app, form, store) = app_parts().await;
+    let good = minimal_instance(form.id, "uuid:55555555-5555-5555-5555-555555555555");
+
+    // no instance part at all.
+    let resp = post_submission(
+        &app,
+        &[part(
+            "some_file",
+            Some("a.jpg"),
+            "image/jpeg",
+            b"x".to_vec(),
+        )],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // instance that is not xml.
+    let resp = post_submission(&app, &[instance_part("<data><unclosed>")]).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // a form id that is not a uuid, and one that is unknown.
+    let bogus = r#"<?xml version="1.0"?><data id="not-a-uuid"><meta xmlns="http://openrosa.org/xforms"><instanceID>uuid:x</instanceID></meta></data>"#;
+    assert_eq!(
+        post_submission(&app, &[instance_part(bogus)])
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let unknown = minimal_instance(Uuid::new_v4(), "uuid:66666666-6666-6666-6666-666666666666");
+    assert_eq!(
+        post_submission(&app, &[instance_part(&unknown)])
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // a value that does not fit its declared type.
+    let bad_type = instance_xml(
+        form.id,
+        "uuid:77777777-7777-7777-7777-777777777777",
+        "<q_text>x</q_text><q_integer>not a number</q_integer>",
+    );
+    assert_eq!(
+        post_submission(&app, &[instance_part(&bad_type)])
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // and the good one still works afterwards.
+    assert_eq!(
+        post_submission(&app, &[instance_part(&good)])
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(store.list_submissions(form.id).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn validation_failures_come_back_in_the_envelope() {
+    let (app, form, store) = app_parts().await;
+
+    // q_text is required by the form; omitting it must not store anything.
+    let xml = instance_xml(
+        form.id,
+        "uuid:88888888-8888-8888-8888-888888888888",
+        "<q_integer>1</q_integer>",
+    );
+    let resp = post_submission(&app, &[instance_part(&xml)]).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let doc = parse(&body_string(resp).await);
+    assert_eq!(doc.first().unwrap().name, "OpenRosaResponse");
+    assert!(
+        doc.find("message").unwrap().text.contains("q_text"),
+        "the message must name the offending field"
+    );
+    assert!(store.list_submissions(form.id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn xml_entity_expansion_is_refused() {
+    let (app, form, store) = app_parts().await;
+
+    // the classic billion-laughs shape: quick-xml never substitutes declared
+    // entities, and we reject the dtd outright rather than trusting that.
+    let billion_laughs = format!(
+        r#"<?xml version="1.0"?>
+<!DOCTYPE data [
+  <!ENTITY lol "lol">
+  <!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">
+  <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">
+]>
+<data id="{}" version="1">
+  <q_text>&lol3;</q_text>
+  <meta xmlns="http://openrosa.org/xforms"><instanceID>uuid:aaaa</instanceID></meta>
+</data>"#,
+        form.id
+    );
+    let resp = post_submission(&app, &[instance_part(&billion_laughs)]).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // an external-entity reference with no dtd at all is still refused.
+    let undefined_entity = instance_xml(
+        form.id,
+        "uuid:99999999-9999-9999-9999-999999999999",
+        "<q_text>&xxe;</q_text>",
+    );
+    let resp = post_submission(&app, &[instance_part(&undefined_entity)]).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    assert!(store.list_submissions(form.id).await.unwrap().is_empty());
+
+    // the five predefined entities and numeric char refs still work.
+    let escaped = instance_xml(
+        form.id,
+        "uuid:abababab-abab-abab-abab-abababababab",
+        "<q_text>a &amp; b &#65;</q_text>",
+    );
+    assert_eq!(
+        post_submission(&app, &[instance_part(&escaped)])
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    let stored = store.list_submissions(form.id).await.unwrap();
+    assert_eq!(
+        stored[0].values.get("q_text"),
+        Some(&FieldValue::Text("a & b A".into()))
+    );
+}
+
+#[tokio::test]
+async fn deeply_nested_instances_are_refused() {
+    let (app, form, _store) = app_parts().await;
+
+    let depth = 500;
+    let mut xml = format!(
+        r#"<?xml version="1.0"?><data id="{}" version="1">"#,
+        form.id
+    );
+    xml.push_str(&"<a>".repeat(depth));
+    xml.push_str(&"</a>".repeat(depth));
+    xml.push_str("</data>");
+
+    let resp = post_submission(&app, &[instance_part(&xml)]).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn submission_requires_basic_auth() {
+    let (app, form, store) = app_parts().await;
+    let xml = minimal_instance(form.id, "uuid:cdcdcdcd-cdcd-cdcd-cdcd-cdcdcdcdcdcd");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/submission")
+                .header("content-type", "multipart/form-data; boundary=X")
+                .body(Body::from("--X--\r\n"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(resp.headers().get("www-authenticate").is_some());
+
+    let resp = app
+        .clone()
+        .oneshot(multipart_request(
+            "/submission",
+            TEST_EMAIL,
+            "wrong password",
+            &[instance_part(&xml)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    assert!(store.list_submissions(form.id).await.unwrap().is_empty());
+}
+
 // ---- fixtures ----------------------------------------------------------
 
 fn kitchen_sink_form() -> Form {
@@ -475,6 +883,13 @@ fn kitchen_sink_form() -> Form {
 }
 
 async fn app_with_form() -> (axum::Router, Form) {
+    let (app, form, _store) = app_parts().await;
+    (app, form)
+}
+
+/// The router plus a direct handle on the store, so tests can assert on what
+/// was actually persisted rather than on the response alone.
+async fn app_parts() -> (axum::Router, Form, Store) {
     let store = Store::connect(":memory:").await.unwrap();
     store
         .create_user(&UserRecord {
@@ -488,9 +903,10 @@ async fn app_with_form() -> (axum::Router, Form) {
     let form = kitchen_sink_form();
     store.insert_form(&form).await.unwrap();
 
-    let mut config = Config::new(TEST_SECRET, std::env::temp_dir().join("collecta-or-tests"));
+    let dir = std::env::temp_dir().join(format!("collecta-or-{}", Uuid::new_v4()));
+    let mut config = Config::new(TEST_SECRET, &dir);
     config.base_url = Some("http://collecta.test".to_string());
-    (router(store, config), form)
+    (router(store.clone(), config), form, store)
 }
 
 fn authed(method: &str, uri: &str, email: &str, password: &str) -> Request<Body> {
@@ -501,6 +917,100 @@ fn authed(method: &str, uri: &str, email: &str, password: &str) -> Request<Body>
         .header("Authorization", format!("Basic {credentials}"))
         .body(Body::empty())
         .unwrap()
+}
+
+// ---- multipart and instance fixtures -----------------------------------
+
+/// One multipart part: name, optional filename, content type, bytes.
+struct Part {
+    name: String,
+    filename: Option<String>,
+    content_type: String,
+    bytes: Vec<u8>,
+}
+
+fn part(name: &str, filename: Option<&str>, content_type: &str, bytes: Vec<u8>) -> Part {
+    Part {
+        name: name.to_string(),
+        filename: filename.map(str::to_string),
+        content_type: content_type.to_string(),
+        bytes,
+    }
+}
+
+fn instance_part(xml: &str) -> Part {
+    part(
+        "xml_submission_file",
+        Some("submission.xml"),
+        "text/xml",
+        xml.as_bytes().to_vec(),
+    )
+}
+
+const BOUNDARY: &str = "----collectaTestBoundary";
+
+fn multipart_body(parts: &[Part]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for part in parts {
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        let disposition = match &part.filename {
+            Some(filename) => format!(
+                "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
+                part.name, filename
+            ),
+            None => format!("Content-Disposition: form-data; name=\"{}\"\r\n", part.name),
+        };
+        body.extend_from_slice(disposition.as_bytes());
+        body.extend_from_slice(format!("Content-Type: {}\r\n\r\n", part.content_type).as_bytes());
+        body.extend_from_slice(&part.bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    body
+}
+
+fn multipart_request(uri: &str, email: &str, password: &str, parts: &[Part]) -> Request<Body> {
+    let credentials = BASE64.encode(format!("{email}:{password}"));
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("Authorization", format!("Basic {credentials}"))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .body(Body::from(multipart_body(parts)))
+        .unwrap()
+}
+
+async fn post_submission(app: &axum::Router, parts: &[Part]) -> Response {
+    app.clone()
+        .oneshot(multipart_request(
+            "/submission",
+            TEST_EMAIL,
+            TEST_PASSWORD,
+            parts,
+        ))
+        .await
+        .unwrap()
+}
+
+/// An instance shaped the way ODK Collect submits: form id and version on the
+/// root, answers as children, instanceID in the openrosa meta block.
+fn instance_xml(form_id: Uuid, instance_id: &str, body: &str) -> String {
+    format!(
+        r#"<?xml version="1.0"?>
+<data id="{form_id}" version="1">
+  {body}
+  <meta xmlns="http://openrosa.org/xforms">
+    <instanceID>{instance_id}</instanceID>
+  </meta>
+</data>"#
+    )
+}
+
+fn minimal_instance(form_id: Uuid, instance_id: &str) -> String {
+    instance_xml(form_id, instance_id, "<q_text>Alpha</q_text>")
 }
 
 async fn body_string(resp: Response) -> String {

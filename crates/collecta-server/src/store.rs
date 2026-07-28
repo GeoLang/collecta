@@ -43,12 +43,21 @@ pub struct AttachmentRow {
     pub storage_path: String,
 }
 
+/// A submission already filed under a `meta/instanceID`.
+pub struct StoredInstance {
+    pub submission: Submission,
+    /// Hash of the instance xml that created it, for detecting a collision
+    /// rather than a genuine resubmission.
+    pub instance_hash: String,
+}
+
 /// Result of claiming a `meta/instanceID` for a form.
 pub enum InstanceInsert {
     /// The instance was new; this is its submission id.
     Created(Uuid),
-    /// That instance id was already taken, by this submission.
-    Existing(Submission),
+    /// That instance id was already taken, by this submission. Boxed to keep
+    /// the enum small on the common path.
+    Existing(Box<StoredInstance>),
 }
 
 /// A stored user. Internal to the server: carries the password hash and is
@@ -160,6 +169,10 @@ impl Store {
     async fn migrate_submissions_instance_id(&self) -> Result<(), sqlx::Error> {
         self.add_column("ALTER TABLE submissions ADD COLUMN instance_id TEXT NOT NULL DEFAULT ''")
             .await?;
+        self.add_column(
+            "ALTER TABLE submissions ADD COLUMN instance_hash TEXT NOT NULL DEFAULT ''",
+        )
+        .await?;
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS submissions_form_instance
              ON submissions (form_id, instance_id) WHERE instance_id != ''",
@@ -288,14 +301,17 @@ impl Store {
         &self,
         submission: &Submission,
         instance_id: &str,
+        instance_hash: &str,
     ) -> Result<InstanceInsert, sqlx::Error> {
         let insert = sqlx::query(
-            "INSERT INTO submissions (id, form_id, data, instance_id) VALUES (?, ?, ?, ?)",
+            "INSERT INTO submissions (id, form_id, data, instance_id, instance_hash)
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind(submission.id.to_string())
         .bind(submission.form_id.to_string())
         .bind(encode_json(submission))
         .bind(instance_id)
+        .bind(instance_hash)
         .execute(&self.pool)
         .await;
 
@@ -309,7 +325,7 @@ impl Store {
                     .find_instance(submission.form_id, instance_id)
                     .await?
                     .ok_or(e)?;
-                Ok(InstanceInsert::Existing(existing))
+                Ok(InstanceInsert::Existing(Box::new(existing)))
             }
             Err(e) => Err(e),
         }
@@ -320,13 +336,19 @@ impl Store {
         &self,
         form_id: Uuid,
         instance_id: &str,
-    ) -> Result<Option<Submission>, sqlx::Error> {
-        let row = sqlx::query("SELECT data FROM submissions WHERE form_id = ? AND instance_id = ?")
-            .bind(form_id.to_string())
-            .bind(instance_id)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.as_ref().map(row_json))
+    ) -> Result<Option<StoredInstance>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT data, instance_hash FROM submissions
+             WHERE form_id = ? AND instance_id = ?",
+        )
+        .bind(form_id.to_string())
+        .bind(instance_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| StoredInstance {
+            submission: row_json(&row),
+            instance_hash: row.get("instance_hash"),
+        }))
     }
 
     /// Record an attachment and mirror it onto the submission's own list.
