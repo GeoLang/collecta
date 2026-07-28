@@ -11,8 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - OpenRosa compatibility layer so ODK Collect can use collecta as its server:
   `GET /formList`, `GET /forms/{id}/form.xml`, and `HEAD`/`POST /submission`,
   authenticated with HTTP Basic against the existing users table.
-- XForm generation from the stored form model, copying the preserved raw
-  relevant/constraint/calculation XPath into the binds for Collect to evaluate.
+- XForm generation from the stored form model, putting the preserved
+  relevant/constraint/calculation expressions into the binds for Collect to
+  evaluate, with the XLSForm `${name}` shorthand rewritten to the referenced
+  field's path the way pyxform does it (relative within a repeat, absolute
+  otherwise) and `${name}` in labels and hints emitted as `<output>`. A
+  reference that cannot be resolved fails rendering instead of emitting broken
+  XPath that JavaRosa rejects.
 - Submission ingest: instance XML parsed into typed field values, run through the
   existing validation engine, made idempotent on `meta/instanceID`.
 - Attachment storage on disk under `COLLECTA_DATA_DIR`, indexed by a new

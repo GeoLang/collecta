@@ -30,7 +30,7 @@ It provides:
 **Working:** the Axum server, SQLite persistence, JWT auth, form CRUD, submission
 validation and ingestion, XLSForm import, the push/pull sync endpoints, and an
 OpenRosa compatibility layer that ODK Collect can submit to. All are covered by
-tests (`cargo test` runs 91).
+tests (`cargo test` runs 95).
 
 **Not built yet:**
 
@@ -154,11 +154,26 @@ and nothing here can enforce that for you. Every response carries
 Forms are generated from the stored form model. Field types map to XForm binds
 (`text`→`xsd:string`, `integer`→`xsd:int`, `geopoint`/`geotrace`/`geoshape`,
 `photo`/`audio`/`video`/`file`/`signature`→`binary` uploads, `select_one`→`select1`
-with inline choices, repeats→repeat groups). The raw `relevant`, `constraint`,
-`calculation`, and `constraint_message` expressions the XLSForm importer preserved
-are copied into the binds verbatim: they are XPath, and **Collect evaluates them on
-the device**. Collecta still does not evaluate them server-side, so what the server
-enforces on ingest is only what its own validation engine models.
+with inline choices, repeats→repeat groups). The `relevant`, `constraint`, and
+`calculation` expressions the XLSForm importer preserved go into the binds, and
+**Collect evaluates them on the device**. Collecta still does not evaluate them
+server-side, so what the server enforces on ingest is only what its own validation
+engine models.
+
+The one thing the renderer rewrites is the XLSForm `${name}` shorthand, which is not
+XPath. Like pyxform, it becomes the referenced field's path: absolute
+(`/data/consent`) in general, and relative (`../sibling`) when the referring field
+and its target are in the same repeat, since an absolute path there would resolve to
+the first repeat instance rather than the current one. A `${name}` in a label or hint
+becomes an inline `<output value="..."/>`. Everything around a reference is passed
+through untouched.
+
+A reference that cannot be resolved fails rendering rather than emitting broken
+XPath, and the form is omitted from `/formList` with the reason available from the
+download route. That covers a name no field defines, a name defined twice, anything
+that is not a plain field name (`${last-saved#x}` included), and a `${...}` in
+`constraint_message`, which becomes the `jr:constraintMsg` attribute and cannot carry
+an `<output>` child.
 
 `meta/instanceID` is the idempotency key. Collect splits a large submission across
 several POSTs, repeating the identical instance XML each time, so:

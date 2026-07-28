@@ -140,10 +140,11 @@ fn xform_renders_every_field_type() {
 }
 
 #[test]
-fn xform_copies_raw_xpath_verbatim_into_binds() {
+fn xform_rewrites_field_references_to_xpath() {
     let mut form = Form::new("Expressions");
+    form.add_field(FormField::text("consent", "Consent given"));
     let mut field = FormField::text("age", "Age");
-    // exactly what the xlsform importer preserved, xpath and all.
+    // exactly what the xlsform importer preserved, ${} shorthand and all.
     field
         .metadata
         .insert("relevant".into(), "${consent} = 'yes'".into());
@@ -152,7 +153,7 @@ fn xform_copies_raw_xpath_verbatim_into_binds() {
         .insert("constraint".into(), ". > 0 and . < 120".into());
     field
         .metadata
-        .insert("calculation".into(), "concat('a', 'b')".into());
+        .insert("calculation".into(), "concat(${consent}, 'x')".into());
     field
         .metadata
         .insert("constraint_message".into(), "Must be 1-119".into());
@@ -162,16 +163,172 @@ fn xform_copies_raw_xpath_verbatim_into_binds() {
     let doc = parse(&xml);
     let bind = bind_for(&doc, "/data/age");
 
-    assert_eq!(bind.attr("relevant").as_deref(), Some("${consent} = 'yes'"));
+    // ${consent} is xlsform shorthand, not xpath. JavaRosa rejects the form if
+    // it survives into the bind, so it must become the field's path.
+    let relevant = bind.attr("relevant").unwrap();
+    assert!(
+        relevant.contains("/data/consent") && relevant.contains("= 'yes'"),
+        "relevant was {relevant:?}"
+    );
+    // expressions with no reference are passed through untouched.
     assert_eq!(
         bind.attr("constraint").as_deref(),
         Some(". > 0 and . < 120")
     );
-    assert_eq!(bind.attr("calculate").as_deref(), Some("concat('a', 'b')"));
+    let calculate = bind.attr("calculate").unwrap();
+    assert!(
+        calculate.contains("concat(") && calculate.contains("/data/consent"),
+        "calculate was {calculate:?}"
+    );
     assert_eq!(
         bind.attr("jr:constraintMsg").as_deref(),
         Some("Must be 1-119")
     );
+
+    assert!(
+        !xml.contains("${"),
+        "no xlsform shorthand may survive into the document"
+    );
+}
+
+#[test]
+fn xform_rewrites_references_inside_repeats_relative_to_the_instance() {
+    let mut form = Form::new("Repeat references");
+    form.add_field(FormField::text("survey_date", "Survey date"));
+
+    let mut child_name = FormField::text("child_name", "Child name");
+    // a reference to a top-level field from inside a repeat stays absolute.
+    child_name
+        .metadata
+        .insert("relevant".into(), "${survey_date} != ''".into());
+
+    let mut child_age = FormField::text("child_age", "Child age");
+    // a reference to a sibling in the same repeat must be relative: an
+    // absolute path would resolve to the first repeat instance every time.
+    child_age
+        .metadata
+        .insert("relevant".into(), "${child_name} != ''".into());
+    child_age
+        .metadata
+        .insert("constraint".into(), ". > 0".into());
+
+    let mut repeat = FormField::text("child", "Children");
+    repeat.field_type = FieldType::Repeat;
+    repeat.children = Some(vec![child_name, child_age]);
+    form.add_field(repeat);
+
+    let xml = xform::render(&form).unwrap();
+    let doc = parse(&xml);
+
+    // pyxform pads substitutions with spaces, so compare on collapsed runs.
+    assert_eq!(
+        collapse(
+            &bind_for(&doc, "/data/child/child_age")
+                .attr("relevant")
+                .unwrap()
+        ),
+        "../child_name != ''",
+        "same-repeat sibling reference must be relative"
+    );
+    let cross = bind_for(&doc, "/data/child/child_name")
+        .attr("relevant")
+        .unwrap();
+    assert!(
+        cross.contains("/data/survey_date") && !cross.contains(".."),
+        "reference out of the repeat stays absolute, was {cross:?}"
+    );
+    assert!(!xml.contains("${"));
+}
+
+#[test]
+fn xform_renders_references_in_labels_as_outputs() {
+    let mut form = Form::new("Labels");
+    form.add_field(FormField::text("child_name", "Child name"));
+    let mut age = FormField::text("child_age", "Age of ${child_name}");
+    age.hint = Some("How old is ${child_name}?".into());
+    form.add_field(age);
+
+    let xml = xform::render(&form).unwrap();
+    let doc = parse(&xml);
+
+    // a label cannot hold an xpath as text, it needs an <output> child.
+    let outputs = doc.all("output");
+    assert_eq!(
+        outputs.len(),
+        2,
+        "one output for the label, one for the hint"
+    );
+    for output in outputs {
+        assert_eq!(output.attr("value").as_deref(), Some("/data/child_name"));
+    }
+    // the literal text around the reference survives as label text.
+    assert!(
+        doc.all("label").iter().any(|l| l.text.contains("Age of")),
+        "labels were {:?}",
+        doc.all("label").iter().map(|l| &l.text).collect::<Vec<_>>()
+    );
+    assert!(!xml.contains("${"));
+}
+
+#[test]
+fn xform_refuses_references_it_cannot_resolve() {
+    // a reference to a field that does not exist.
+    let mut form = Form::new("Dangling");
+    let mut field = FormField::text("age", "Age");
+    field
+        .metadata
+        .insert("relevant".into(), "${nonexistent} = 'yes'".into());
+    form.add_field(field);
+    let error = xform::render(&form).unwrap_err().to_string();
+    assert!(
+        error.contains("nonexistent") && error.contains("age"),
+        "the error must name both the reference and the field, was {error:?}"
+    );
+
+    // an unterminated or malformed reference.
+    for expression in ["${unterminated", "${not a name}", "${last-saved#age}"] {
+        let mut form = Form::new("Malformed");
+        form.add_field(FormField::text("age", "Age"));
+        let mut field = FormField::text("other", "Other");
+        field.metadata.insert("relevant".into(), expression.into());
+        form.add_field(field);
+        assert!(
+            xform::render(&form).is_err(),
+            "{expression:?} must fail rendering, not emit broken xpath"
+        );
+    }
+
+    // a reference in the constraint message, which is a plain attribute and
+    // cannot carry an <output>.
+    let mut form = Form::new("Message");
+    form.add_field(FormField::text("limit", "Limit"));
+    let mut field = FormField::text("age", "Age");
+    field
+        .metadata
+        .insert("constraint_message".into(), "Must be under ${limit}".into());
+    form.add_field(field);
+    let error = xform::render(&form).unwrap_err().to_string();
+    assert!(error.contains("constraint_message"), "was {error:?}");
+}
+
+#[test]
+fn xform_refuses_ambiguous_references() {
+    // the same name at the top level and inside a repeat: a reference to it
+    // could mean either, so it must not be guessed.
+    let mut form = Form::new("Ambiguous");
+    form.add_field(FormField::text("name", "Name"));
+    let mut repeat = FormField::text("group", "Group");
+    repeat.field_type = FieldType::Repeat;
+    repeat.children = Some(vec![FormField::text("name", "Name")]);
+    form.add_field(repeat);
+    let mut field = FormField::text("other", "Other");
+    field
+        .metadata
+        .insert("relevant".into(), "${name} != ''".into());
+    form.add_field(field);
+
+    let error = xform::render(&form).unwrap_err().to_string();
+    assert!(error.contains("name"), "was {error:?}");
 }
 
 #[test]
@@ -1428,4 +1585,10 @@ fn control<'a>(doc: &'a [Element], element: &str, reference: &str) -> &'a Elemen
     doc.iter()
         .find(|e| e.name == element && e.attr("ref").as_deref() == Some(reference))
         .unwrap_or_else(|| panic!("no {element} for {reference}"))
+}
+
+/// Collapse whitespace runs, so assertions do not depend on the padding around
+/// a substituted reference.
+fn collapse(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
