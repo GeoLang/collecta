@@ -20,17 +20,17 @@ It provides:
 - **Form schemas** with typed fields, conditional logic, and validation constraints
 - **GPS capture types** (point, trace, shape) in the form model
 - **REST API** for form management and submission ingestion, persisted to SQLite
-- **JWT auth** with argon2id password hashing and admin-seeded users
+- **JWT auth** with argon2id password hashing, admin-seeded users, and three roles
 - **Sync protocol**: idempotent submission push and cursor-based form pull
 - **XLSForm import** (`.xlsx` survey/choices/settings) into the form model
 - **Offline sync queue** as a library type in `collecta-core`, for a client to build on
 
 ### Status
 
-**Working:** the Axum server, SQLite persistence, JWT auth, form CRUD, submission
-validation and ingestion, XLSForm import, the push/pull sync endpoints, and an
-OpenRosa compatibility layer that ODK Collect can submit to. All are covered by
-tests (`cargo test` runs 95).
+**Working:** the Axum server, SQLite persistence, JWT auth with role and form-ownership
+checks, form CRUD, submission validation and ingestion, XLSForm import, the push/pull
+sync endpoints, and an OpenRosa compatibility layer that ODK Collect can submit to.
+All are covered by tests (`cargo test` runs 103).
 
 **Not built yet:**
 
@@ -43,8 +43,9 @@ tests (`cargo test` runs 95).
   the data directory and in the `attachments` table.
 - **No deletes.** There are no tombstones and no delete endpoints for forms or
   submissions, so sync cannot propagate a deletion.
-- **Roles are not enforced.** The JWT carries a `role` claim and no endpoint checks it.
-  Any valid account can read and write every form, over either API.
+- **No per-form sharing.** Roles are instance-wide and a form's submissions are
+  readable by its creator and by admins. There is no grant table, so letting a second
+  account read one form's data is not expressible.
 - **No Ptolemy integration.** Writing collected features through to the geodatabase is
   planned, not wired up.
 
@@ -112,22 +113,22 @@ A `collecta-core` library type for a client to drive. No client in this repo use
 
 ### REST API
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/health` | Health check (public) |
-| POST | `/api/v1/auth/login` | Exchange email/password for a JWT (public) |
-| GET | `/api/v1/forms` | List all forms |
-| POST | `/api/v1/forms` | Create a form (JSON) |
-| POST | `/api/v1/forms/import` | Import an XLSForm (`.xlsx` request body) |
-| GET | `/api/v1/forms/{id}` | Get form schema |
-| GET | `/api/v1/forms/{id}/submissions` | List submissions |
-| POST | `/api/v1/forms/{id}/submissions` | Submit data (validates against schema) |
-| GET | `/api/v1/sync/status` | Get sync queue status |
-| POST | `/api/v1/sync/push` | Batch-upload queued submissions (idempotent) |
-| GET | `/api/v1/sync/forms?since=<cursor>` | Form definitions updated since cursor |
+| Method | Endpoint | Description | Who |
+|--------|----------|-------------|-----|
+| GET | `/health` | Health check (public) | anyone |
+| POST | `/api/v1/auth/login` | Exchange email/password for a JWT (public) | anyone |
+| GET | `/api/v1/forms` | List all forms | any account |
+| POST | `/api/v1/forms` | Create a form (JSON) | editor, admin |
+| POST | `/api/v1/forms/import` | Import an XLSForm (`.xlsx` request body) | editor, admin |
+| GET | `/api/v1/forms/{id}` | Get form schema | any account |
+| GET | `/api/v1/forms/{id}/submissions` | List submissions | form creator, admin |
+| POST | `/api/v1/forms/{id}/submissions` | Submit data (validates against schema) | editor, admin |
+| GET | `/api/v1/sync/status` | Get sync queue status (whole instance) | admin |
+| POST | `/api/v1/sync/push` | Batch-upload queued submissions (idempotent) | editor, admin |
+| GET | `/api/v1/sync/forms?since=<cursor>` | Form definitions updated since cursor | any account |
 
 All endpoints except `/health` and login require `Authorization: Bearer <jwt>`. There is
-no delete endpoint.
+no delete endpoint. See [Authentication and roles](#authentication-and-roles).
 
 ---
 
@@ -137,15 +138,16 @@ Collecta serves the OpenRosa APIs at the server root, so ODK Collect can use it 
 its server. Point Collect at the server URL and give it an account created with
 `create-user`.
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/formList` | Form list XML, one entry per renderable form |
-| GET | `/forms/{id}/form.xml` | The form rendered as an ODK XForm |
-| HEAD | `/submission` | Auth and capability preflight (204) |
-| POST | `/submission` | `multipart/form-data` submission plus attachments |
+| Method | Endpoint | Description | Who |
+|--------|----------|-------------|-----|
+| GET | `/formList` | Form list XML, one entry per renderable form | any account |
+| GET | `/forms/{id}/form.xml` | The form rendered as an ODK XForm | any account |
+| HEAD | `/submission` | Auth and capability preflight (204) | any account |
+| POST | `/submission` | `multipart/form-data` submission plus attachments | editor, admin |
 
 These routes use **HTTP Basic** against the same users table as the JSON API, since
-Collect has no concept of a bearer token. A request without credentials gets a 401
+Collect has no concept of a bearer token. Give a collector the `editor` role: a `viewer`
+can download forms but gets a 403 on submit. A request without credentials gets a 401
 with `WWW-Authenticate: Basic realm="collecta"`, which is the challenge Collect waits
 for. **Run this behind TLS**: the OpenRosa auth spec forbids Basic over plain HTTP,
 and nothing here can enforce that for you. Every response carries
@@ -198,16 +200,32 @@ rendered as an XForm and is omitted from `/formList`.
 
 ---
 
-## Authentication
+## Authentication and roles
 
 Users are admin-seeded, there is no signup endpoint. Passwords are hashed with
 argon2id, tokens are HS256 JWTs (claims `sub`/`exp`/`role`, 24h expiry, same
-conventions as tiletopia-server). The `role` claim is carried but not checked: every
-valid token has the same access.
+conventions as tiletopia-server).
+
+Every account has one of three roles, and the same roles apply over the OpenRosa
+routes:
+
+| Role | Can |
+|------|-----|
+| `viewer` | find forms and read form schemas, nothing else |
+| `editor` | that, plus create and import forms, and submit data to any form |
+| `admin` | everything, including every form's submissions and the sync queue status |
+
+A form records who created it. Its submissions are readable by that account and by
+admins, and its id cannot be reused by anyone else. Forms created before roles were
+enforced have no creator, so only an admin can read their submissions.
+
+Any other role string is refused everywhere rather than treated as the weakest role,
+so an account carrying one can log in and do nothing. `create-user` rejects it.
 
 ```bash
-# seed a user (password read from stdin)
+# seed a user (password read from stdin, role defaults to admin)
 cargo run -p collecta-server -- create-user admin@example.com
+cargo run -p collecta-server -- create-user field@example.com editor
 
 # log in, then send the token as a bearer header
 curl -X POST http://localhost:3000/api/v1/auth/login \

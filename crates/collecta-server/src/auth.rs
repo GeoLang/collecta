@@ -10,6 +10,7 @@ use std::sync::LazyLock;
 use argon2::Argon2;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use axum::Extension;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
@@ -18,6 +19,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::AppState;
 use crate::store::UserRecord;
@@ -29,7 +31,52 @@ pub const TOKEN_TTL_HOURS: i64 = 24;
 pub struct Claims {
     pub sub: String,
     pub exp: usize,
+    /// Role name, one of the strings [`Role::parse`] accepts.
     pub role: String,
+}
+
+/// What an account may do. Stored as a string in the users table and copied
+/// into the `role` claim.
+///
+/// A string that is not one of these does not parse, so a typo in `create-user`
+/// or a role from some future version grants nothing rather than defaulting to
+/// something permissive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Admin,
+    Editor,
+    Viewer,
+}
+
+impl Role {
+    pub fn parse(s: &str) -> Option<Role> {
+        match s {
+            "admin" => Some(Role::Admin),
+            "editor" => Some(Role::Editor),
+            "viewer" => Some(Role::Viewer),
+            _ => None,
+        }
+    }
+
+    /// May create forms and file submissions. Viewers are read-only.
+    pub fn can_write(self) -> bool {
+        matches!(self, Role::Admin | Role::Editor)
+    }
+
+    pub fn is_admin(self) -> bool {
+        matches!(self, Role::Admin)
+    }
+}
+
+/// The user behind a bearer-token request.
+///
+/// Handlers read this from request extensions. It is inserted only after the
+/// token verified and both `sub` and `role` parsed, so holding one is proof the
+/// caller is authenticated with a role this server understands.
+#[derive(Debug, Clone, Copy)]
+pub struct Caller {
+    pub id: Uuid,
+    pub role: Role,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,14 +143,48 @@ fn extract_claims(request: &Request, secret: &str) -> Result<Claims, StatusCode>
 }
 
 /// Middleware guarding all data endpoints: rejects requests without a valid
-/// bearer token and exposes the claims to handlers via request extensions.
+/// bearer token and exposes the [`Caller`] to handlers via request extensions.
+///
+/// A token whose `role` this server does not know is refused here rather than
+/// treated as the weakest role, so every route behind this layer is closed to
+/// an account nobody has assigned a valid role.
 pub async fn require_auth(
     State(state): State<AppState>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     let claims = extract_claims(&request, &state.jwt_secret)?;
-    request.extensions_mut().insert(claims);
+    // a sub that is not a user id cannot be a token this server minted.
+    let id: Uuid = claims.sub.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let role = Role::parse(&claims.role).ok_or(StatusCode::FORBIDDEN)?;
+    request.extensions_mut().insert(Caller { id, role });
+    Ok(next.run(request).await)
+}
+
+/// Route layer for endpoints that create forms or file submissions.
+///
+/// Must be applied inside [`require_auth`], which is what puts the [`Caller`]
+/// in the extensions.
+pub async fn require_write(
+    Extension(caller): Extension<Caller>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if !caller.role.can_write() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(next.run(request).await)
+}
+
+/// Route layer for endpoints covering the whole instance rather than one form.
+pub async fn require_admin(
+    Extension(caller): Extension<Caller>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if !caller.role.is_admin() {
+        return Err(StatusCode::FORBIDDEN);
+    }
     Ok(next.run(request).await)
 }
 

@@ -11,7 +11,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use collecta_core::form::{Choice, FieldType, Form, FormField};
 use collecta_core::submission::{FieldValue, GeoPoint};
 use collecta_server::openrosa::xform;
-use collecta_server::store::{Store, UserRecord};
+use collecta_server::store::{FormWriter, Store, UserRecord};
 use collecta_server::{Config, router};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
@@ -755,7 +755,7 @@ async fn another_user_cannot_extend_someone_elses_instance() {
             id: Uuid::new_v4(),
             email: "intruder@example.com".to_string(),
             password_hash: collecta_server::auth::hash_password(TEST_PASSWORD),
-            role: "collector".to_string(),
+            role: "editor".to_string(),
         })
         .await
         .unwrap();
@@ -988,6 +988,68 @@ async fn submission_requires_basic_auth() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    assert!(store.list_submissions(form.id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn only_accounts_that_may_write_can_submit() {
+    let (app, form, store) = app_parts().await;
+    for (email, role) in [
+        ("viewer@example.com", "viewer"),
+        ("legacy-role@example.com", "collector"),
+    ] {
+        store
+            .create_user(&UserRecord {
+                id: Uuid::new_v4(),
+                email: email.to_string(),
+                password_hash: collecta_server::auth::hash_password(TEST_PASSWORD),
+                role: role.to_string(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let xml = minimal_instance(form.id, "uuid:efefefef-efef-efef-efef-efefefefefef");
+    for email in ["viewer@example.com", "legacy-role@example.com"] {
+        let resp = app
+            .clone()
+            .oneshot(multipart_request(
+                "/submission",
+                email,
+                TEST_PASSWORD,
+                &[instance_part(&xml)],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{email}");
+    }
+
+    // a viewer can still discover forms; the role only stops the write.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            "/formList",
+            "viewer@example.com",
+            TEST_PASSWORD,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // and an unknown role does not even get that far.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            "/formList",
+            "legacy-role@example.com",
+            TEST_PASSWORD,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     assert!(store.list_submissions(form.id).await.unwrap().is_empty());
 }
@@ -1256,7 +1318,10 @@ async fn the_same_instance_id_on_a_different_form_is_a_separate_submission() {
     // a second form, so the two share an instanceID but nothing else.
     let mut other = kitchen_sink_form();
     other.title = "Other".to_string();
-    store.insert_form(&other).await.unwrap();
+    store
+        .insert_form(&other, FormWriter::system())
+        .await
+        .unwrap();
 
     let instance_id = "uuid:aaaa1111-0000-0000-0000-000000000007";
     for form_id in [form.id, other.id] {
@@ -1357,12 +1422,15 @@ async fn app_parts_with_dir() -> (axum::Router, Form, Store, tempfile::TempDir) 
             id: Uuid::new_v4(),
             email: TEST_EMAIL.to_string(),
             password_hash: collecta_server::auth::hash_password(TEST_PASSWORD),
-            role: "collector".to_string(),
+            role: "editor".to_string(),
         })
         .await
         .unwrap();
     let form = kitchen_sink_form();
-    store.insert_form(&form).await.unwrap();
+    store
+        .insert_form(&form, FormWriter::system())
+        .await
+        .unwrap();
 
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config::new(TEST_SECRET, dir.path());

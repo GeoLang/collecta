@@ -8,7 +8,7 @@ use collecta_core::form::{Form, FormField};
 use collecta_core::submission::{FieldValue, Submission};
 use collecta_core::sync_protocol::{FormsPullResponse, PushItemStatus, PushRequest, PushResponse};
 use collecta_server::auth::{Claims, TokenResponse, hash_password};
-use collecta_server::store::{Store, UserRecord};
+use collecta_server::store::{FormOwner, FormWriter, Store, UserRecord};
 use collecta_server::{Config, router};
 use rust_xlsxwriter::Workbook;
 use serde::Serialize;
@@ -155,7 +155,10 @@ async fn submissions_survive_restart() {
     let sub_id;
     {
         let store = Store::connect(&db).await.unwrap();
-        store.insert_form(&form).await.unwrap();
+        store
+            .insert_form(&form, FormWriter::system())
+            .await
+            .unwrap();
         let mut sub = Submission::new(form_id, form.version);
         sub.set_value("site_name", FieldValue::Text("Alpha".into()));
         sub_id = sub.id;
@@ -375,8 +378,14 @@ async fn sync_forms_cursor_tiebreaks_identical_timestamps() {
 
     let form_a = Form::new("First");
     let form_b = Form::new("Second");
-    store.insert_form(&form_a).await.unwrap();
-    store.insert_form(&form_b).await.unwrap();
+    store
+        .insert_form(&form_a, FormWriter::system())
+        .await
+        .unwrap();
+    store
+        .insert_form(&form_b, FormWriter::system())
+        .await
+        .unwrap();
 
     // the clock makes this collision rare, not impossible: force it.
     let pool = SqlitePool::connect_with(SqliteConnectOptions::new().filename(&db))
@@ -416,6 +425,344 @@ async fn sync_forms_cursor_tiebreaks_identical_timestamps() {
     let resp = app.clone().oneshot(get(&uri, &token)).await.unwrap();
     let pull3: FormsPullResponse = json_body(resp).await;
     assert_eq!(pull3.forms.len(), 2);
+}
+
+// a database written before forms had a creator must still open, and the forms
+// already in it must come back unowned rather than attributed to anyone.
+#[tokio::test]
+async fn a_database_without_creator_id_migrates() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("old.db").to_str().unwrap().to_string();
+    let form = one_field_form("Old");
+
+    let pool = SqlitePool::connect_with(
+        SqliteConnectOptions::new()
+            .filename(&db)
+            .create_if_missing(true),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE forms (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            data TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT ''
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO forms (id, title, version, data) VALUES (?, ?, 1, ?)")
+        .bind(form.id.to_string())
+        .bind(&form.title)
+        .bind(serde_json::to_string(&form).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let store = Store::connect(&db).await.unwrap();
+    assert_eq!(store.list_forms().await.unwrap().len(), 1);
+    assert_eq!(
+        store.form_owner(form.id).await.unwrap(),
+        Some(FormOwner::Legacy)
+    );
+}
+
+// ---- authorization -----------------------------------------------------
+
+const EDITOR_A: &str = "editor-a@example.com";
+const EDITOR_B: &str = "editor-b@example.com";
+const VIEWER: &str = "viewer@example.com";
+const UNKNOWN_ROLE: &str = "collector@example.com";
+
+/// App with the seeded admin plus two editors, a viewer, and an account whose
+/// stored role is not one this server knows. All share `TEST_PASSWORD`.
+async fn authz_app() -> (axum::Router, Store) {
+    let store = seeded_store(":memory:").await;
+    for (email, role) in [
+        (EDITOR_A, "editor"),
+        (EDITOR_B, "editor"),
+        (VIEWER, "viewer"),
+        (UNKNOWN_ROLE, "collector"),
+    ] {
+        store
+            .create_user(&UserRecord {
+                id: Uuid::new_v4(),
+                email: email.to_string(),
+                password_hash: hash_password(TEST_PASSWORD),
+                role: role.to_string(),
+            })
+            .await
+            .unwrap();
+    }
+    (router(store.clone(), test_config()), store)
+}
+
+fn one_field_form(title: &str) -> Form {
+    let mut form = Form::new(title);
+    form.add_field(FormField::text("site_name", "Site Name").set_required());
+    form
+}
+
+fn filled_submission(form: &Form) -> Submission {
+    let mut submission = Submission::new(form.id, form.version);
+    submission.set_value("site_name", FieldValue::Text("Alpha".into()));
+    submission
+}
+
+async fn create_form(app: &axum::Router, token: &str, form: &Form) -> StatusCode {
+    app.clone()
+        .oneshot(post_json("/api/v1/forms", token, form))
+        .await
+        .unwrap()
+        .status()
+}
+
+async fn submit(app: &axum::Router, token: &str, form: &Form) -> StatusCode {
+    app.clone()
+        .oneshot(post_json(
+            &format!("/api/v1/forms/{}/submissions", form.id),
+            token,
+            &filled_submission(form),
+        ))
+        .await
+        .unwrap()
+        .status()
+}
+
+async fn list_submissions(app: &axum::Router, token: &str, form: &Form) -> Response {
+    app.clone()
+        .oneshot(get(
+            &format!("/api/v1/forms/{}/submissions", form.id),
+            token,
+        ))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn viewers_can_read_but_cannot_write() {
+    let (app, _store) = authz_app().await;
+    let editor = login(&app, EDITOR_A, TEST_PASSWORD).await;
+    let viewer = login(&app, VIEWER, TEST_PASSWORD).await;
+
+    let form = one_field_form("Site");
+    assert_eq!(create_form(&app, &editor, &form).await, StatusCode::CREATED);
+
+    // discovery is open: a collector has to be able to find a form.
+    for uri in [
+        "/api/v1/forms".to_string(),
+        format!("/api/v1/forms/{}", form.id),
+    ] {
+        let resp = app.clone().oneshot(get(&uri, &viewer)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+    }
+
+    assert_eq!(
+        create_form(&app, &viewer, &one_field_form("Mine")).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(submit(&app, &viewer, &form).await, StatusCode::FORBIDDEN);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/forms/import")
+                .header("Authorization", format!("Bearer {viewer}"))
+                .body(Body::from(tiny_xlsform()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/sync/push",
+            &viewer,
+            &PushRequest {
+                submissions: vec![filled_submission(&form)],
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // nothing a viewer sent got through.
+    let resp = list_submissions(&app, &editor, &form).await;
+    let stored: Vec<Submission> = json_body(resp).await;
+    assert!(stored.is_empty());
+}
+
+#[tokio::test]
+async fn an_editor_can_submit_to_another_editors_form_but_not_read_it() {
+    let (app, _store) = authz_app().await;
+    let admin = login(&app, TEST_EMAIL, TEST_PASSWORD).await;
+    let a = login(&app, EDITOR_A, TEST_PASSWORD).await;
+    let b = login(&app, EDITOR_B, TEST_PASSWORD).await;
+
+    let form = one_field_form("Site");
+    assert_eq!(create_form(&app, &a, &form).await, StatusCode::CREATED);
+
+    assert_eq!(submit(&app, &a, &form).await, StatusCode::CREATED);
+    assert_eq!(submit(&app, &b, &form).await, StatusCode::CREATED);
+
+    // collected data belongs to whoever created the form.
+    assert_eq!(
+        list_submissions(&app, &b, &form).await.status(),
+        StatusCode::FORBIDDEN
+    );
+
+    for token in [&a, &admin] {
+        let resp = list_submissions(&app, token, &form).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let stored: Vec<Submission> = json_body(resp).await;
+        assert_eq!(stored.len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn a_form_id_cannot_be_taken_over() {
+    let (app, _store) = authz_app().await;
+    let admin = login(&app, TEST_EMAIL, TEST_PASSWORD).await;
+    let a = login(&app, EDITOR_A, TEST_PASSWORD).await;
+    let b = login(&app, EDITOR_B, TEST_PASSWORD).await;
+
+    let form = one_field_form("Site");
+    assert_eq!(create_form(&app, &a, &form).await, StatusCode::CREATED);
+
+    // posting a form is an upsert, so reusing an id would otherwise rewrite
+    // someone else's form and pull its submissions across with it.
+    let mut hijack = one_field_form("Hijacked");
+    hijack.id = form.id;
+    assert_eq!(create_form(&app, &b, &hijack).await, StatusCode::FORBIDDEN);
+
+    let resp = app
+        .clone()
+        .oneshot(get(&format!("/api/v1/forms/{}", form.id), &b))
+        .await
+        .unwrap();
+    let stored: Form = json_body(resp).await;
+    assert_eq!(stored.title, "Site");
+
+    // an admin may overwrite it, and that does not transfer ownership.
+    let mut edited = one_field_form("Edited");
+    edited.id = form.id;
+    assert_eq!(
+        create_form(&app, &admin, &edited).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        list_submissions(&app, &a, &form).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        list_submissions(&app, &b, &form).await.status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn forms_with_no_recorded_creator_are_admin_only() {
+    let (app, store) = authz_app().await;
+    let admin = login(&app, TEST_EMAIL, TEST_PASSWORD).await;
+    let a = login(&app, EDITOR_A, TEST_PASSWORD).await;
+
+    // a form from a database written before creators were recorded.
+    let form = one_field_form("Legacy");
+    store
+        .insert_form(&form, FormWriter::system())
+        .await
+        .unwrap();
+
+    assert_eq!(submit(&app, &a, &form).await, StatusCode::CREATED);
+    assert_eq!(
+        list_submissions(&app, &a, &form).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    let resp = list_submissions(&app, &admin, &form).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let stored: Vec<Submission> = json_body(resp).await;
+    assert_eq!(stored.len(), 1);
+}
+
+#[tokio::test]
+async fn sync_status_is_admin_only_and_the_form_pull_is_not() {
+    let (app, _store) = authz_app().await;
+    let admin = login(&app, TEST_EMAIL, TEST_PASSWORD).await;
+    let a = login(&app, EDITOR_A, TEST_PASSWORD).await;
+    let b = login(&app, EDITOR_B, TEST_PASSWORD).await;
+    let viewer = login(&app, VIEWER, TEST_PASSWORD).await;
+
+    let form_a = one_field_form("A");
+    let form_b = one_field_form("B");
+    assert_eq!(create_form(&app, &a, &form_a).await, StatusCode::CREATED);
+    assert_eq!(create_form(&app, &b, &form_b).await, StatusCode::CREATED);
+
+    // queue counts cover the whole instance, so they are admin-only.
+    let resp = app
+        .clone()
+        .oneshot(get("/api/v1/sync/status", &a))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = app
+        .clone()
+        .oneshot(get("/api/v1/sync/status", &admin))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // the form pull is discovery: an editor gets forms they did not create, so
+    // they can collect against them offline. A viewer sees them too.
+    for token in [&a, &b, &viewer, &admin] {
+        let resp = app
+            .clone()
+            .oneshot(get("/api/v1/sync/forms", token))
+            .await
+            .unwrap();
+        let pull: FormsPullResponse = json_body(resp).await;
+        let mut ids: Vec<_> = pull.forms.iter().map(|f| f.id).collect();
+        ids.sort();
+        let mut expected = vec![form_a.id, form_b.id];
+        expected.sort();
+        assert_eq!(ids, expected);
+    }
+}
+
+// a role string this server cannot map to a permission set is not treated as
+// the weakest role: it gets nothing at all.
+#[tokio::test]
+async fn an_unknown_role_is_refused_everywhere() {
+    let (app, _store) = authz_app().await;
+    let editor = login(&app, EDITOR_A, TEST_PASSWORD).await;
+    let form = one_field_form("Site");
+    assert_eq!(create_form(&app, &editor, &form).await, StatusCode::CREATED);
+
+    // the credentials are good: authentication is not what fails.
+    let token = login(&app, UNKNOWN_ROLE, TEST_PASSWORD).await;
+
+    for uri in [
+        "/api/v1/forms".to_string(),
+        format!("/api/v1/forms/{}", form.id),
+        format!("/api/v1/forms/{}/submissions", form.id),
+        "/api/v1/sync/forms".to_string(),
+        "/api/v1/sync/status".to_string(),
+    ] {
+        let resp = app.clone().oneshot(get(&uri, &token)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+    }
+    assert_eq!(
+        create_form(&app, &token, &one_field_form("Mine")).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(submit(&app, &token, &form).await, StatusCode::FORBIDDEN);
 }
 
 fn urlencode(s: &str) -> String {

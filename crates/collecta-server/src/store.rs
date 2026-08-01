@@ -60,6 +60,36 @@ pub enum InstanceInsert {
     Existing(Box<StoredInstance>),
 }
 
+/// Who a form belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormOwner {
+    /// Written before creators were recorded, so there is nobody to match a
+    /// caller against.
+    Legacy,
+    User(Uuid),
+}
+
+/// Who is writing a form.
+///
+/// `id` becomes the form's `creator_id` on insert. On an overwrite the write is
+/// refused unless `id` matches the stored creator or `overwrite_any` is set.
+#[derive(Debug, Clone, Copy)]
+pub struct FormWriter {
+    pub id: Option<Uuid>,
+    pub overwrite_any: bool,
+}
+
+impl FormWriter {
+    /// A writer with no user identity and no ownership restriction, for
+    /// fixtures and CLI seeding. Forms it writes are [`FormOwner::Legacy`].
+    pub fn system() -> Self {
+        Self {
+            id: None,
+            overwrite_any: true,
+        }
+    }
+}
+
 /// A stored user. Internal to the server: carries the password hash and is
 /// never serialized into responses.
 #[derive(Debug, Clone)]
@@ -99,7 +129,8 @@ impl Store {
                 title TEXT NOT NULL,
                 version INTEGER NOT NULL,
                 data TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT ''
+                updated_at TEXT NOT NULL DEFAULT '',
+                creator_id TEXT
             )",
             "CREATE TABLE IF NOT EXISTS submissions (
                 id TEXT PRIMARY KEY,
@@ -134,6 +165,7 @@ impl Store {
             sqlx::query(ddl).execute(&self.pool).await?;
         }
         self.migrate_forms_updated_at().await?;
+        self.migrate_forms_creator_id().await?;
         self.migrate_submissions_instance_id().await
     }
 
@@ -163,6 +195,14 @@ impl Store {
         Ok(())
     }
 
+    // forms written before ownership existed keep a null creator_id. They are
+    // not backfilled to anyone: an unowned form is admin-only, which is the
+    // closed reading, and guessing an owner would hand someone else's data out.
+    async fn migrate_forms_creator_id(&self) -> Result<(), sqlx::Error> {
+        self.add_column("ALTER TABLE forms ADD COLUMN creator_id TEXT")
+            .await
+    }
+
     // openrosa submissions carry a client-generated meta/instanceID used as the
     // idempotency key. The index is partial so rows from the json api, which
     // have no instance id, are not forced into a single '' collision.
@@ -182,18 +222,51 @@ impl Store {
         Ok(())
     }
 
-    pub async fn insert_form(&self, form: &Form) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "INSERT OR REPLACE INTO forms (id, title, version, data, updated_at) VALUES (?, ?, ?, ?, ?)",
+    /// Insert a form, or overwrite one the writer is allowed to replace.
+    /// Returns false when the id is already taken by someone else's form.
+    ///
+    /// Posting a form whose id exists is an update, so the ownership test is
+    /// part of the upsert rather than a separate read: a form created between a
+    /// check and a write cannot be overwritten. `creator_id` is set on insert
+    /// and never reassigned, so an admin editing a form does not take it over.
+    pub async fn insert_form(&self, form: &Form, writer: FormWriter) -> Result<bool, sqlx::Error> {
+        let writer_id = writer.id.map(|id| id.to_string());
+        let result = sqlx::query(
+            "INSERT INTO forms (id, title, version, data, updated_at, creator_id)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                 title = excluded.title,
+                 version = excluded.version,
+                 data = excluded.data,
+                 updated_at = excluded.updated_at
+             WHERE ? OR forms.creator_id = ?",
         )
         .bind(form.id.to_string())
         .bind(&form.title)
         .bind(form.version as i64)
         .bind(encode_json(form))
         .bind(timestamp_now())
+        .bind(&writer_id)
+        .bind(writer.overwrite_any)
+        .bind(&writer_id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// The owner of a form, or `None` when there is no such form.
+    pub async fn form_owner(&self, form_id: Uuid) -> Result<Option<FormOwner>, sqlx::Error> {
+        let row = sqlx::query("SELECT creator_id FROM forms WHERE id = ?")
+            .bind(form_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|row| {
+            let creator: Option<String> = row.get("creator_id");
+            match creator.and_then(|id| id.parse().ok()) {
+                Some(id) => FormOwner::User(id),
+                None => FormOwner::Legacy,
+            }
+        }))
     }
 
     pub async fn list_forms(&self) -> Result<Vec<Form>, sqlx::Error> {

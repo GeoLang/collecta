@@ -30,6 +30,12 @@ async fn create_user(args: &[String]) {
         std::process::exit(2);
     };
     let role = args.get(1).cloned().unwrap_or_else(|| "admin".to_string());
+    // an account with a role the server cannot parse can log in and do nothing,
+    // so refuse to create one.
+    if collecta_server::auth::Role::parse(&role).is_none() {
+        eprintln!("role must be one of: admin, editor, viewer");
+        std::process::exit(2);
+    }
 
     let mut password = String::new();
     std::io::stdin()

@@ -55,6 +55,15 @@ pub async fn submit(
     Extension(user): Extension<OpenRosaUser>,
     multipart: Multipart,
 ) -> Result<Response, OpenRosaError> {
+    // checked before the body is read, so a viewer's upload is refused without
+    // buffering it.
+    if !user.role.can_write() {
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            "this account cannot submit data",
+        ));
+    }
+
     let (instance_xml, attachments) = read_parts(multipart).await?;
 
     let instance_xml = instance_xml.ok_or_else(|| {

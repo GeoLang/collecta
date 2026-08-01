@@ -26,7 +26,7 @@ use axum::routing::{get, post};
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::auth::{BASIC_CHALLENGE, parse_basic_header, verify_basic};
+use crate::auth::{BASIC_CHALLENGE, Role, parse_basic_header, verify_basic};
 use crate::store::UserRecord;
 
 /// Largest POST body this server tells clients to send, in bytes.
@@ -70,17 +70,19 @@ pub fn router(state: AppState) -> Router<AppState> {
 /// The user a Basic-authenticated OpenRosa request belongs to.
 ///
 /// Handlers read this from request extensions; it is only ever inserted after
-/// a successful password verification.
-#[derive(Clone)]
+/// a successful password verification and a role this server understands.
+#[derive(Clone, Copy)]
 pub struct OpenRosaUser {
     pub id: Uuid,
+    pub role: Role,
 }
 
 /// HTTP Basic against the users table.
 ///
 /// Any missing, malformed, or wrong credential yields the same 401 challenge:
 /// the failure reason is never disclosed, and nothing derived from the header
-/// is logged.
+/// is logged. A verified account whose stored role is not one of
+/// [`Role`]'s gets nothing rather than the weakest role.
 async fn require_basic(
     State(state): State<AppState>,
     mut request: axum::extract::Request,
@@ -108,9 +110,12 @@ async fn require_basic(
     let Some(user) = user else {
         return challenge();
     };
+    let Some(role) = Role::parse(&user.role) else {
+        return error(StatusCode::FORBIDDEN, "account role is not recognised").into_response();
+    };
     request
         .extensions_mut()
-        .insert(OpenRosaUser { id: user.id });
+        .insert(OpenRosaUser { id: user.id, role });
     next.run(request).await
 }
 

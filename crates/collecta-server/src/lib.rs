@@ -7,6 +7,11 @@
 //! only `/health` and login itself are public. Users are admin-seeded via the
 //! `create-user` CLI subcommand, there is no signup endpoint.
 //!
+//! On top of that, each account carries a role ([`auth::Role`]): admins can do
+//! everything, editors can create forms and submit, viewers can only read. Form
+//! discovery is open to any authenticated account because collectors need it,
+//! but a form's submissions are only readable by whoever created the form.
+//!
 //! [`openrosa`] adds a second, Basic-authenticated surface at the server root
 //! for ODK Collect. The two share the users table and nothing else.
 
@@ -17,13 +22,13 @@ pub mod store;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
-use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::Json;
 use axum::routing::{get, post};
+use axum::{Extension, Router};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -34,7 +39,8 @@ use collecta_core::sync_protocol::{
 };
 use collecta_core::validation;
 
-use store::Store;
+use auth::Caller;
+use store::{FormOwner, FormWriter, Store};
 
 /// Server settings that are not the database.
 pub struct Config {
@@ -83,17 +89,26 @@ pub fn router(store: Store, config: Config) -> Router {
         data_dir: Arc::from(config.data_dir.as_path()),
         base_url: config.base_url.as_deref().map(Arc::from),
     };
-    let protected = Router::new()
-        .route("/api/v1/forms", get(list_forms).post(create_form))
-        .route("/api/v1/forms/import", post(import_form))
+    // form discovery, open to any authenticated account, plus the submission
+    // list, which its handler narrows to the form's creator.
+    let read = Router::new()
+        .route("/api/v1/forms", get(list_forms))
         .route("/api/v1/forms/{form_id}", get(get_form))
-        .route(
-            "/api/v1/forms/{form_id}/submissions",
-            get(list_submissions).post(submit),
-        )
-        .route("/api/v1/sync/status", get(sync_status))
+        .route("/api/v1/forms/{form_id}/submissions", get(list_submissions))
+        .route("/api/v1/sync/forms", get(sync_forms));
+    let write = Router::new()
+        .route("/api/v1/forms", post(create_form))
+        .route("/api/v1/forms/import", post(import_form))
+        .route("/api/v1/forms/{form_id}/submissions", post(submit))
         .route("/api/v1/sync/push", post(sync_push))
-        .route("/api/v1/sync/forms", get(sync_forms))
+        .route_layer(middleware::from_fn(auth::require_write));
+    // instance-wide counts, so there is no creator to compare against.
+    let admin = Router::new()
+        .route("/api/v1/sync/status", get(sync_status))
+        .route_layer(middleware::from_fn(auth::require_admin));
+    let protected = read
+        .merge(write)
+        .merge(admin)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
@@ -145,23 +160,42 @@ async fn list_forms(State(state): State<AppState>) -> Result<Json<Vec<FormSummar
 
 async fn create_form(
     State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Json(form): Json<Form>,
 ) -> Result<(StatusCode, Json<IdResponse>), ApiError> {
     let id = form.id;
-    state.store.insert_form(&form).await?;
+    store_form(&state, &caller, &form).await?;
     Ok((StatusCode::CREATED, Json(IdResponse { id })))
 }
 
 /// Import an XLSForm `.xlsx` (raw request body) and register the resulting form.
 async fn import_form(
     State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<IdResponse>), ApiError> {
     let form = collecta_xlsform::parse_bytes(&body)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     let id = form.id;
-    state.store.insert_form(&form).await?;
+    store_form(&state, &caller, &form).await?;
     Ok((StatusCode::CREATED, Json(IdResponse { id })))
+}
+
+/// Record a form as the caller's. A form carries its own id, so this doubles as
+/// the update path: posting an id that already exists is refused unless the
+/// caller created that form or is an admin.
+async fn store_form(state: &AppState, caller: &Caller, form: &Form) -> Result<(), ApiError> {
+    let writer = FormWriter {
+        id: Some(caller.id),
+        overwrite_any: caller.role.is_admin(),
+    };
+    if state.store.insert_form(form, writer).await? {
+        return Ok(());
+    }
+    Err(ApiError(
+        StatusCode::FORBIDDEN,
+        "that form id belongs to another user".to_string(),
+    ))
 }
 
 async fn get_form(
@@ -176,11 +210,27 @@ async fn get_form(
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "form not found".to_string()))
 }
 
+/// Collected data, readable only by the form's creator and by admins.
 async fn list_submissions(
     State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Path(form_id): Path<Uuid>,
 ) -> Result<Json<Vec<Submission>>, ApiError> {
+    let owner = state
+        .store
+        .form_owner(form_id)
+        .await?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "form not found".to_string()))?;
+    if !owns(&caller, owner) {
+        return Err(ApiError(StatusCode::FORBIDDEN, "not your form".to_string()));
+    }
     Ok(Json(state.store.list_submissions(form_id).await?))
+}
+
+// a form from before creators were recorded has nobody to match the caller
+// against, so only an admin gets at it.
+fn owns(caller: &Caller, owner: FormOwner) -> bool {
+    caller.role.is_admin() || owner == FormOwner::User(caller.id)
 }
 
 async fn submit(
@@ -275,6 +325,10 @@ struct SinceQuery {
 }
 
 /// Form definitions updated since the client's cursor (all forms when absent).
+///
+/// Form discovery, so it is open to any authenticated account like
+/// `GET /api/v1/forms` and OpenRosa's `/formList`: a collector has to be able to
+/// pull a form they did not create in order to submit against it offline.
 async fn sync_forms(
     State(state): State<AppState>,
     Query(query): Query<SinceQuery>,
