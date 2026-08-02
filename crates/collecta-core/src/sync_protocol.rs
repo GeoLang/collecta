@@ -47,9 +47,15 @@ pub struct PushResponse {
 /// Response of `GET /api/v1/sync/forms?since=<cursor>`.
 ///
 /// `cursor` is an opaque string the client stores and sends back as `since`
-/// on the next pull to receive only forms updated afterwards.
+/// on the next pull to receive only forms changed afterwards.
+///
+/// `deleted` carries the tombstones: ids the client should drop, ordered with
+/// `forms` under the one cursor, so a form cannot arrive after the delete that
+/// removed it. It defaults to empty for payloads from before deletes existed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FormsPullResponse {
     pub forms: Vec<Form>,
+    #[serde(default)]
+    pub deleted: Vec<Uuid>,
     pub cursor: String,
 }

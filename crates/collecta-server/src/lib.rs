@@ -10,7 +10,8 @@
 //! On top of that, each account carries a role ([`auth::Role`]): admins can do
 //! everything, editors can create forms and submit, viewers can only read. Form
 //! discovery is open to any authenticated account because collectors need it,
-//! but a form's submissions are only readable by whoever created the form.
+//! but a form's submissions are only readable by whoever created the form, by
+//! an admin, and by any account the creator granted read on that one form.
 //!
 //! [`openrosa`] adds a second, Basic-authenticated surface at the server root
 //! for ODK Collect. The two share the users table and nothing else.
@@ -24,10 +25,11 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
+use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::middleware;
-use axum::response::Json;
-use axum::routing::{get, post};
+use axum::response::{IntoResponse, Json, Response};
+use axum::routing::{delete, get, post};
 use axum::{Extension, Router};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -89,17 +91,29 @@ pub fn router(store: Store, config: Config) -> Router {
         data_dir: Arc::from(config.data_dir.as_path()),
         base_url: config.base_url.as_deref().map(Arc::from),
     };
-    // form discovery, open to any authenticated account, plus the submission
-    // list, which its handler narrows to the form's creator.
+    // form discovery, open to any authenticated account, plus the routes whose
+    // handlers narrow to the form's creator, its grantees, and admins.
     let read = Router::new()
         .route("/api/v1/forms", get(list_forms))
         .route("/api/v1/forms/{form_id}", get(get_form))
         .route("/api/v1/forms/{form_id}/submissions", get(list_submissions))
+        .route("/api/v1/forms/{form_id}/grants", get(list_grants))
+        .route("/api/v1/attachments/{attachment_id}", get(get_attachment))
         .route("/api/v1/sync/forms", get(sync_forms));
     let write = Router::new()
         .route("/api/v1/forms", post(create_form))
         .route("/api/v1/forms/import", post(import_form))
+        .route("/api/v1/forms/{form_id}", delete(delete_form))
         .route("/api/v1/forms/{form_id}/submissions", post(submit))
+        .route(
+            "/api/v1/forms/{form_id}/submissions/{submission_id}",
+            delete(delete_submission),
+        )
+        .route("/api/v1/forms/{form_id}/grants", post(create_grant))
+        .route(
+            "/api/v1/forms/{form_id}/grants/{user_id}",
+            delete(revoke_grant),
+        )
         .route("/api/v1/sync/push", post(sync_push))
         .route_layer(middleware::from_fn(auth::require_write));
     // instance-wide counts, so there is no creator to compare against.
@@ -210,20 +224,13 @@ async fn get_form(
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "form not found".to_string()))
 }
 
-/// Collected data, readable only by the form's creator and by admins.
+/// Collected data, readable by the form's creator, its grantees, and admins.
 async fn list_submissions(
     State(state): State<AppState>,
     Extension(caller): Extension<Caller>,
     Path(form_id): Path<Uuid>,
 ) -> Result<Json<Vec<Submission>>, ApiError> {
-    let owner = state
-        .store
-        .form_owner(form_id)
-        .await?
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "form not found".to_string()))?;
-    if !owns(&caller, owner) {
-        return Err(ApiError(StatusCode::FORBIDDEN, "not your form".to_string()));
-    }
+    require_read(&state, &caller, form_id).await?;
     Ok(Json(state.store.list_submissions(form_id).await?))
 }
 
@@ -233,11 +240,53 @@ fn owns(caller: &Caller, owner: FormOwner) -> bool {
     caller.role.is_admin() || owner == FormOwner::User(caller.id)
 }
 
+/// The owner of a live form, or a 404 when it does not exist or was deleted.
+async fn form_owner(state: &AppState, form_id: Uuid) -> Result<FormOwner, ApiError> {
+    state
+        .store
+        .form_owner(form_id)
+        .await?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "form not found".to_string()))
+}
+
+/// Gate for reading a form's collected data: its creator, an admin, or an
+/// account holding a grant on it.
+async fn require_read(state: &AppState, caller: &Caller, form_id: Uuid) -> Result<(), ApiError> {
+    let owner = form_owner(state, form_id).await?;
+    if owns(caller, owner) || state.store.has_grant(form_id, caller.id).await? {
+        return Ok(());
+    }
+    Err(ApiError(StatusCode::FORBIDDEN, "not your form".to_string()))
+}
+
+/// Gate for changing a form: its creator or an admin.
+///
+/// A grant deliberately does not pass this. Sharing a form is read-only, so a
+/// grantee can neither delete the data nor hand the form on to someone else.
+async fn require_owner(state: &AppState, caller: &Caller, form_id: Uuid) -> Result<(), ApiError> {
+    let owner = form_owner(state, form_id).await?;
+    if owns(caller, owner) {
+        return Ok(());
+    }
+    Err(ApiError(StatusCode::FORBIDDEN, "not your form".to_string()))
+}
+
+/// File one submission against the form named in the path.
+///
+/// The path is authoritative: a body naming a different form is refused rather
+/// than corrected, since validating against one form and filing under another
+/// would put unvalidated data in a form the caller may not even read.
 async fn submit(
     State(state): State<AppState>,
     Path(form_id): Path<Uuid>,
     Json(submission): Json<Submission>,
 ) -> Result<(StatusCode, Json<IdResponse>), ApiError> {
+    if submission.form_id != form_id {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "submission form_id does not match the form in the path".to_string(),
+        ));
+    }
     let form = state
         .store
         .get_form(form_id)
@@ -255,8 +304,169 @@ async fn submit(
     }
 
     let id = submission.id;
-    state.store.insert_submission(&submission).await?;
+    // an id already on file is refused, never overwritten: submission ids are
+    // client-chosen and unique across all forms, so a replace would let anyone
+    // holding an id take the row, and its attachments, away from its form.
+    if !state.store.insert_submission(&submission).await? {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "a submission with this id already exists".to_string(),
+        ));
+    }
     Ok((StatusCode::CREATED, Json(IdResponse { id })))
+}
+
+/// Delete a form and everything collected under it.
+///
+/// The form itself becomes a tombstone the forms pull hands to clients. Its
+/// submissions, their queue entries, their attachments and the grants on it are
+/// removed outright.
+async fn delete_form(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(form_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    require_owner(&state, &caller, form_id).await?;
+    let submissions = state.store.delete_form(form_id).await?;
+    for submission_id in submissions {
+        remove_attachment_files(&state, submission_id).await;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Delete one submission and its attachments.
+///
+/// No tombstone: submissions only travel client to server, so there is no pull
+/// that could hand a deleted one back.
+async fn delete_submission(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path((form_id, submission_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    require_owner(&state, &caller, form_id).await?;
+    if !state
+        .store
+        .delete_submission(form_id, submission_id)
+        .await?
+    {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "submission not found".to_string(),
+        ));
+    }
+    remove_attachment_files(&state, submission_id).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// the rows are already gone when this runs, so a failure here leaks disk rather
+// than data and must not turn a completed delete into an error.
+async fn remove_attachment_files(state: &AppState, submission_id: Uuid) {
+    let directory = openrosa::attachments_dir(&state.data_dir).join(submission_id.to_string());
+    let _ = tokio::fs::remove_dir_all(directory).await;
+}
+
+/// Bytes of one stored attachment, readable by whoever may read the submission
+/// it hangs off.
+///
+/// Served as a download rather than inline: the content type and file name came
+/// from the device that uploaded them, so a crafted html attachment must not be
+/// rendered as a page on this origin.
+async fn get_attachment(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(attachment_id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let missing = || ApiError(StatusCode::NOT_FOUND, "attachment not found".to_string());
+    let stored = state
+        .store
+        .find_attachment(attachment_id)
+        .await?
+        .ok_or_else(missing)?;
+    // the id is the whole secret here, since nothing lists attachments a caller
+    // may not read. A refusal therefore reads the same as an id nobody stored,
+    // rather than confirming that this one exists.
+    if let Err(error) = require_read(&state, &caller, stored.form_id).await {
+        return Err(if error.0 == StatusCode::FORBIDDEN {
+            missing()
+        } else {
+            error
+        });
+    }
+
+    let bytes = tokio::fs::read(&stored.attachment.storage_path)
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "attachment bytes are missing".to_string(),
+            )
+        })?;
+    // the stored type is client-supplied, so anything unusable as a header value
+    // falls back rather than failing the read.
+    let content_type = HeaderValue::from_str(&stored.attachment.content_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    let headers = [
+        (CONTENT_TYPE, content_type),
+        (CONTENT_DISPOSITION, HeaderValue::from_static("attachment")),
+        (
+            HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        ),
+    ];
+    Ok((StatusCode::OK, headers, bytes).into_response())
+}
+
+/// Share one form's collected data with another account, owner or admin only.
+async fn create_grant(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(form_id): Path<Uuid>,
+    Json(request): Json<GrantRequest>,
+) -> Result<StatusCode, ApiError> {
+    require_owner(&state, &caller, form_id).await?;
+    // granting to an id nobody holds is a typo, not a grant to be discovered
+    // later when that uuid happens to be created.
+    if !state.store.user_exists(request.user_id).await? {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "no such user".to_string(),
+        ));
+    }
+    state.store.grant_form(form_id, request.user_id).await?;
+    Ok(StatusCode::CREATED)
+}
+
+async fn revoke_grant(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path((form_id, user_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    require_owner(&state, &caller, form_id).await?;
+    if !state.store.revoke_form(form_id, user_id).await? {
+        return Err(ApiError(StatusCode::NOT_FOUND, "no such grant".to_string()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Who a form is shared with. Owner or admin only: a grantee cannot enumerate
+/// the other accounts holding the same form.
+async fn list_grants(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(form_id): Path<Uuid>,
+) -> Result<Json<Vec<GrantResponse>>, ApiError> {
+    require_owner(&state, &caller, form_id).await?;
+    let grants = state.store.list_grants(form_id).await?;
+    Ok(Json(
+        grants
+            .into_iter()
+            .map(|grant| GrantResponse {
+                user_id: grant.user_id,
+                email: grant.email,
+                granted_at: grant.granted_at,
+            })
+            .collect(),
+    ))
 }
 
 async fn sync_status(State(state): State<AppState>) -> Result<Json<SyncStatusResponse>, ApiError> {
@@ -289,10 +499,16 @@ async fn push_one(store: &Store, submission: &Submission) -> PushItemResult {
         status: PushItemStatus::Error,
         message: Some(message),
     };
+    // a per-item message travels back to a field device, so a storage failure
+    // is reported as one rather than quoting the query that failed.
+    let storage_error = |e: sqlx::Error| {
+        eprintln!("error: storage error: {e}");
+        error("storage error".to_string())
+    };
     let form = match store.get_form(submission.form_id).await {
         Ok(Some(form)) => form,
         Ok(None) => return error(format!("unknown form {}", submission.form_id)),
-        Err(e) => return error(e.to_string()),
+        Err(e) => return storage_error(e),
     };
     let errors = validation::validate(&form, submission);
     if !errors.is_empty() {
@@ -314,7 +530,7 @@ async fn push_one(store: &Store, submission: &Submission) -> PushItemResult {
             status: PushItemStatus::Duplicate,
             message: None,
         },
-        Err(e) => error(e.to_string()),
+        Err(e) => storage_error(e),
     }
 }
 
@@ -324,7 +540,8 @@ struct SinceQuery {
     since: String,
 }
 
-/// Form definitions updated since the client's cursor (all forms when absent).
+/// Form definitions changed since the client's cursor (all forms when absent),
+/// plus the ids of the ones deleted since.
 ///
 /// Form discovery, so it is open to any authenticated account like
 /// `GET /api/v1/forms` and OpenRosa's `/formList`: a collector has to be able to
@@ -333,9 +550,10 @@ async fn sync_forms(
     State(state): State<AppState>,
     Query(query): Query<SinceQuery>,
 ) -> Result<Json<FormsPullResponse>, ApiError> {
-    let (forms, cursor) = state.store.list_forms_since(&query.since).await?;
+    let (forms, deleted, cursor) = state.store.list_forms_since(&query.since).await?;
     Ok(Json(FormsPullResponse {
         forms,
+        deleted,
         cursor: cursor.unwrap_or(query.since),
     }))
 }
@@ -345,7 +563,14 @@ struct ApiError(StatusCode, String);
 
 impl From<sqlx::Error> for ApiError {
     fn from(e: sqlx::Error) -> Self {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        // the storage error text carries query and schema detail, so it goes to
+        // the operator's log and never into the response, matching what the
+        // openrosa surface already does.
+        eprintln!("error: storage error: {e}");
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage error".to_string(),
+        )
     }
 }
 
@@ -377,6 +602,19 @@ impl From<&Form> for FormSummary {
 #[derive(Serialize, Deserialize)]
 struct IdResponse {
     id: Uuid,
+}
+
+/// Body of `POST /api/v1/forms/{id}/grants`.
+#[derive(Deserialize)]
+struct GrantRequest {
+    user_id: Uuid,
+}
+
+#[derive(Serialize)]
+struct GrantResponse {
+    user_id: Uuid,
+    email: String,
+    granted_at: String,
 }
 
 #[derive(Serialize)]

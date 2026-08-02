@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Attachment download (2026-08-02): `GET /api/v1/attachments/{id}` serves the
+  stored bytes under their recorded content type, to whoever may read the
+  submission they hang off. Always `Content-Disposition: attachment` with
+  `X-Content-Type-Options: nosniff`, since the type came off a field device.
+- Deletes (2026-08-02): `DELETE /api/v1/forms/{id}` and
+  `DELETE /api/v1/forms/{id}/submissions/{sid}`, both owner or admin. Deleting a
+  form removes its submissions, their queue entries, their attachment rows and
+  files, and the grants on it, leaving the form row as a tombstone. Deleting a
+  submission is a hard delete.
+- Form tombstones in the sync protocol (2026-08-02): `FormsPullResponse` gained
+  `deleted`, the ids removed since the cursor. Tombstones are the deleted form's
+  own row, so they ride the existing cursor and cannot arrive out of order
+  against an edit. The field defaults to empty when absent, so a payload from an
+  older server still parses.
+- Per-form grants (2026-08-02): a `form_grants` table plus
+  `GET`/`POST /api/v1/forms/{id}/grants` and
+  `DELETE /api/v1/forms/{id}/grants/{user_id}`, owner or admin only. A grant is
+  read-only and covers one form's submissions and their attachments. It does not
+  let the grantee delete anything, re-share the form, or see who else holds a
+  grant.
 - OpenRosa compatibility layer so ODK Collect can use collecta as its server:
   `GET /formList`, `GET /forms/{id}/form.xml`, and `HEAD`/`POST /submission`,
   authenticated with HTTP Basic against the existing users table.
@@ -28,9 +48,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `router()` now takes a `Config` instead of a bare JWT secret. The `/api/v1`
   routes themselves are unchanged.
 - `Store::insert_form` takes a `FormWriter` and returns whether the write was
-  applied; `Store::list_forms_since` takes an optional creator filter.
+  applied; `Store::list_forms_since` also returns the ids deleted since the
+  cursor. `Store::insert_submission` returns whether the row was inserted, false
+  meaning that id was already taken.
 
 ### Security
+- Submission ids are no longer claimable (2026-08-02). The JSON submit route
+  wrote the client's submission with a replace on an id that is client-chosen
+  and unique across every form, so an account that had seen a
+  submission id could refile it under a form of its own. That moved the row, and
+  the attachments hanging off it, into a form the writer controlled, which is
+  the form every per-form check reads authority from. It made a read grant a
+  permanent read plus a delete on the grantor's data, since the ids a grantee
+  legitimately sees kept working after the grant was revoked. An id already on
+  file is now a 409 rather than an overwrite, and the constraint decides so
+  there is no window between the check and the write.
+- The submission body can no longer name a form other than the one in the path
+  (2026-08-02). Validation ran against the path's form while the row was filed
+  under the body's, so a submission could land in someone else's form without
+  ever being checked against its schema. A mismatch is now a 400.
+- Storage errors are no longer echoed to callers (2026-08-02). The JSON API put
+  the sqlx error text, which carries query and schema detail, in the 500 body
+  and in per-item sync push messages. It now goes to the server log and the
+  caller gets `storage error`, matching what the OpenRosa surface already did.
+- An attachment a caller may not read answers 404 rather than 403 (2026-08-02),
+  so holding a guessed id cannot confirm it exists.
 - Role-based authorization on top of authentication (2026-08-01). Until now any
   valid token or Basic credential had full access to every form and every
   submission over both APIs.
@@ -50,5 +92,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     admin-only.
   - Forms created before this change have no creator. They are readable by
     admins only, since there is nobody to match a caller against.
-  - Access is instance-wide per role: there is no per-form grant, so sharing one
-    form's submissions with a second account is not expressible yet.
+  - Access is instance-wide per role. Per-form grants landed on 2026-08-02, see
+    above.

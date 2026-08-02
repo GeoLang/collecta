@@ -8,7 +8,7 @@ use collecta_core::form::{Form, FormField};
 use collecta_core::submission::{FieldValue, Submission};
 use collecta_core::sync_protocol::{FormsPullResponse, PushItemStatus, PushRequest, PushResponse};
 use collecta_server::auth::{Claims, TokenResponse, hash_password};
-use collecta_server::store::{FormOwner, FormWriter, Store, UserRecord};
+use collecta_server::store::{AttachmentRow, FormOwner, FormWriter, Store, UserRecord};
 use collecta_server::{Config, router};
 use rust_xlsxwriter::Workbook;
 use serde::Serialize;
@@ -162,7 +162,7 @@ async fn submissions_survive_restart() {
         let mut sub = Submission::new(form_id, form.version);
         sub.set_value("site_name", FieldValue::Text("Alpha".into()));
         sub_id = sub.id;
-        store.insert_submission(&sub).await.unwrap();
+        assert!(store.insert_submission(&sub).await.unwrap());
     } // store dropped: pool closed, simulating shutdown.
 
     // reopen the same file: a fresh process would see committed data.
@@ -478,9 +478,9 @@ const EDITOR_B: &str = "editor-b@example.com";
 const VIEWER: &str = "viewer@example.com";
 const UNKNOWN_ROLE: &str = "collector@example.com";
 
-/// App with the seeded admin plus two editors, a viewer, and an account whose
+/// Store with the seeded admin plus two editors, a viewer, and an account whose
 /// stored role is not one this server knows. All share `TEST_PASSWORD`.
-async fn authz_app() -> (axum::Router, Store) {
+async fn authz_store() -> Store {
     let store = seeded_store(":memory:").await;
     for (email, role) in [
         (EDITOR_A, "editor"),
@@ -498,7 +498,25 @@ async fn authz_app() -> (axum::Router, Store) {
             .await
             .unwrap();
     }
+    store
+}
+
+async fn authz_app() -> (axum::Router, Store) {
+    let store = authz_store().await;
     (router(store.clone(), test_config()), store)
+}
+
+/// The same fixture over a real data directory, for the routes that read or
+/// remove attachment bytes.
+async fn authz_app_with_dir() -> (axum::Router, Store, tempfile::TempDir) {
+    let store = authz_store().await;
+    let dir = tempfile::tempdir().unwrap();
+    let app = router(store.clone(), Config::new(TEST_SECRET, dir.path()));
+    (app, store, dir)
+}
+
+async fn user_id(store: &Store, email: &str) -> Uuid {
+    store.get_user_by_email(email).await.unwrap().unwrap().id
 }
 
 fn one_field_form(title: &str) -> Form {
@@ -765,6 +783,608 @@ async fn an_unknown_role_is_refused_everywhere() {
     assert_eq!(submit(&app, &token, &form).await, StatusCode::FORBIDDEN);
 }
 
+// ---- attachment download -----------------------------------------------
+
+#[tokio::test]
+async fn an_attachment_is_readable_by_exactly_who_may_read_its_submission() {
+    let (app, store, dir) = authz_app_with_dir().await;
+    let admin = login(&app, TEST_EMAIL, TEST_PASSWORD).await;
+    let a = login(&app, EDITOR_A, TEST_PASSWORD).await;
+    let b = login(&app, EDITOR_B, TEST_PASSWORD).await;
+
+    let form = one_field_form("Site");
+    assert_eq!(create_form(&app, &a, &form).await, StatusCode::CREATED);
+    let submission = filled_submission(&form);
+    assert_eq!(
+        post_submission(&app, &a, &submission).await,
+        StatusCode::CREATED
+    );
+    let attachment = store_attachment(&store, &dir, submission.id, b"JPEGBYTES").await;
+    let uri = format!("/api/v1/attachments/{attachment}");
+
+    // the form's creator gets the bytes back, unchanged, under the type they
+    // were stored with.
+    let resp = app.clone().oneshot(get(&uri, &a)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header(&resp, "content-type"), "image/jpeg");
+    // never inline: the type and name came off a field device.
+    assert_eq!(header(&resp, "content-disposition"), "attachment");
+    assert_eq!(header(&resp, "x-content-type-options"), "nosniff");
+    assert_eq!(body_bytes(resp).await, b"JPEGBYTES");
+
+    // an admin too, an unrelated editor not. A refusal is a 404, the same as an
+    // id nobody stored, so holding a guessed id cannot confirm it exists.
+    assert_eq!(
+        app.clone()
+            .oneshot(get(&uri, &admin))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.clone().oneshot(get(&uri, &b)).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        app.clone().oneshot(get(&uri, "")).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // an id nobody stored is a 404, not a disk read.
+    let resp = app
+        .clone()
+        .oneshot(get(&format!("/api/v1/attachments/{}", Uuid::new_v4()), &a))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ---- deletes -----------------------------------------------------------
+
+#[tokio::test]
+async fn deleting_a_form_tombstones_it_and_takes_its_data_with_it() {
+    let (app, store, dir) = authz_app_with_dir().await;
+    let a = login(&app, EDITOR_A, TEST_PASSWORD).await;
+    let b = login(&app, EDITOR_B, TEST_PASSWORD).await;
+    let viewer = login(&app, VIEWER, TEST_PASSWORD).await;
+
+    let form = one_field_form("Site");
+    assert_eq!(create_form(&app, &a, &form).await, StatusCode::CREATED);
+    let submission = filled_submission(&form);
+    assert_eq!(
+        post_submission(&app, &a, &submission).await,
+        StatusCode::CREATED
+    );
+    let attachment = store_attachment(&store, &dir, submission.id, b"JPEGBYTES").await;
+    let file = store.list_attachments(submission.id).await.unwrap()[0]
+        .storage_path
+        .clone();
+
+    // a cursor from before the delete, so the pull below has something to be
+    // measured against.
+    let resp = app
+        .clone()
+        .oneshot(get("/api/v1/sync/forms", &a))
+        .await
+        .unwrap();
+    let before: FormsPullResponse = json_body(resp).await;
+    assert!(before.deleted.is_empty());
+
+    let uri = format!("/api/v1/forms/{}", form.id);
+    assert_eq!(
+        app.clone().oneshot(del(&uri, &b)).await.unwrap().status(),
+        StatusCode::FORBIDDEN,
+        "another editor must not be able to delete the form"
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(del(&uri, &viewer))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(!store.list_submissions(form.id).await.unwrap().is_empty());
+
+    assert_eq!(
+        app.clone().oneshot(del(&uri, &a)).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+
+    // the form is gone from every read path, and so is everything under it.
+    assert_eq!(
+        app.clone().oneshot(get(&uri, &a)).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+    let resp = app.clone().oneshot(get("/api/v1/forms", &a)).await.unwrap();
+    let forms: Vec<serde_json::Value> = json_body(resp).await;
+    assert!(forms.is_empty());
+    assert_eq!(
+        list_submissions(&app, &a, &form).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert!(store.list_submissions(form.id).await.unwrap().is_empty());
+    assert!(
+        store
+            .list_attachments(submission.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(get(&format!("/api/v1/attachments/{attachment}"), &a))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert!(
+        !std::path::Path::new(&file).exists(),
+        "{file} still on disk"
+    );
+    let counts = store.sync_counts().await.unwrap();
+    assert_eq!(counts.total, 0, "the queue entry went with the submission");
+
+    // and the delete reaches a client that already pulled the form.
+    let resp = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/sync/forms?since={}", urlencode(&before.cursor)),
+            &a,
+        ))
+        .await
+        .unwrap();
+    let pull: FormsPullResponse = json_body(resp).await;
+    assert!(pull.forms.is_empty());
+    assert_eq!(pull.deleted, vec![form.id], "the tombstone must sync");
+
+    // deleting it again finds nothing left to delete.
+    assert_eq!(
+        app.clone().oneshot(del(&uri, &a)).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_submission_leaves_the_form_and_the_other_submissions() {
+    let (app, store, dir) = authz_app_with_dir().await;
+    let a = login(&app, EDITOR_A, TEST_PASSWORD).await;
+    let b = login(&app, EDITOR_B, TEST_PASSWORD).await;
+
+    let form = one_field_form("Site");
+    let other = one_field_form("Other");
+    assert_eq!(create_form(&app, &a, &form).await, StatusCode::CREATED);
+    assert_eq!(create_form(&app, &a, &other).await, StatusCode::CREATED);
+
+    let doomed = filled_submission(&form);
+    let kept = filled_submission(&form);
+    for submission in [&doomed, &kept] {
+        assert_eq!(
+            post_submission(&app, &a, submission).await,
+            StatusCode::CREATED
+        );
+    }
+    let attachment = store_attachment(&store, &dir, doomed.id, b"JPEGBYTES").await;
+    let file = store.list_attachments(doomed.id).await.unwrap()[0]
+        .storage_path
+        .clone();
+
+    let uri = format!("/api/v1/forms/{}/submissions/{}", form.id, doomed.id);
+    assert_eq!(
+        app.clone().oneshot(del(&uri, &b)).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // naming a form the caller does own does not reach a submission filed
+    // under a different one.
+    let crossed = format!("/api/v1/forms/{}/submissions/{}", other.id, doomed.id);
+    assert_eq!(
+        app.clone()
+            .oneshot(del(&crossed, &a))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(store.list_submissions(form.id).await.unwrap().len(), 2);
+
+    assert_eq!(
+        app.clone().oneshot(del(&uri, &a)).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let stored = store.list_submissions(form.id).await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].id, kept.id, "the wrong submission was deleted");
+    assert!(store.list_attachments(doomed.id).await.unwrap().is_empty());
+    assert!(!std::path::Path::new(&file).exists());
+    assert_eq!(
+        app.clone()
+            .oneshot(get(&format!("/api/v1/attachments/{attachment}"), &a))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(store.sync_counts().await.unwrap().total, 1);
+
+    // the form itself survived, and so did the second delete's 404.
+    assert_eq!(
+        list_submissions(&app, &a, &form).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.clone().oneshot(del(&uri, &a)).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+// ---- per-form grants ---------------------------------------------------
+
+#[tokio::test]
+async fn a_grant_opens_one_form_to_one_account_and_nothing_more() {
+    let (app, store, dir) = authz_app_with_dir().await;
+    let a = login(&app, EDITOR_A, TEST_PASSWORD).await;
+    let b = login(&app, EDITOR_B, TEST_PASSWORD).await;
+    let b_id = user_id(&store, EDITOR_B).await;
+
+    let shared = one_field_form("Shared");
+    let private = one_field_form("Private");
+    assert_eq!(create_form(&app, &a, &shared).await, StatusCode::CREATED);
+    assert_eq!(create_form(&app, &a, &private).await, StatusCode::CREATED);
+    let submission = filled_submission(&shared);
+    assert_eq!(
+        post_submission(&app, &a, &submission).await,
+        StatusCode::CREATED
+    );
+    let attachment = store_attachment(&store, &dir, submission.id, b"JPEGBYTES").await;
+
+    let grants = format!("/api/v1/forms/{}/grants", shared.id);
+    let attachment_uri = format!("/api/v1/attachments/{attachment}");
+
+    // nothing is shared to begin with, and the grantee cannot share to itself.
+    assert_eq!(
+        list_submissions(&app, &b, &shared).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post_json_status(&app, &grants, &b, &serde_json::json!({ "user_id": b_id })).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(get(&grants, &b))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // a grant to an id nobody holds is refused rather than stored.
+    assert_eq!(
+        post_json_status(
+            &app,
+            &grants,
+            &a,
+            &serde_json::json!({ "user_id": Uuid::new_v4() })
+        )
+        .await,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    assert_eq!(
+        post_json_status(&app, &grants, &a, &serde_json::json!({ "user_id": b_id })).await,
+        StatusCode::CREATED
+    );
+
+    // the grantee now reads that form's submissions and their attachments.
+    let resp = list_submissions(&app, &b, &shared).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let stored: Vec<Submission> = json_body(resp).await;
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].id, submission.id);
+    assert_eq!(
+        app.clone()
+            .oneshot(get(&attachment_uri, &b))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    // and nothing else: not the owner's other form, not the delete, not the
+    // sharing itself.
+    assert_eq!(
+        list_submissions(&app, &b, &private).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(del(&format!("/api/v1/forms/{}", shared.id), &b))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(del(
+                &format!("/api/v1/forms/{}/submissions/{}", shared.id, submission.id),
+                &b,
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(get(&grants, &b))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // the owner sees who holds it.
+    let resp = app.clone().oneshot(get(&grants, &a)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let listed: Vec<serde_json::Value> = json_body(resp).await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["user_id"], b_id.to_string());
+    assert_eq!(listed[0]["email"], EDITOR_B);
+
+    // revoking closes it again.
+    let revoke = format!("/api/v1/forms/{}/grants/{}", shared.id, b_id);
+    assert_eq!(
+        app.clone()
+            .oneshot(del(&revoke, &b))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(del(&revoke, &a))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        list_submissions(&app, &b, &shared).await.status(),
+        StatusCode::FORBIDDEN,
+        "a revoked grant must not still read"
+    );
+    // the attachment closes as a 404, so a revoked grantee holding the id from
+    // when they could read cannot even confirm it is still there.
+    assert_eq!(
+        app.clone()
+            .oneshot(get(&attachment_uri, &b))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(del(&revoke, &a))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn an_admin_can_share_a_form_it_does_not_own() {
+    let (app, store) = authz_app().await;
+    let admin = login(&app, TEST_EMAIL, TEST_PASSWORD).await;
+    let a = login(&app, EDITOR_A, TEST_PASSWORD).await;
+    let viewer = login(&app, VIEWER, TEST_PASSWORD).await;
+    let viewer_id = user_id(&store, VIEWER).await;
+
+    let form = one_field_form("Site");
+    assert_eq!(create_form(&app, &a, &form).await, StatusCode::CREATED);
+    assert_eq!(submit(&app, &a, &form).await, StatusCode::CREATED);
+
+    let grants = format!("/api/v1/forms/{}/grants", form.id);
+    assert_eq!(
+        list_submissions(&app, &viewer, &form).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post_json_status(
+            &app,
+            &grants,
+            &admin,
+            &serde_json::json!({ "user_id": viewer_id })
+        )
+        .await,
+        StatusCode::CREATED
+    );
+
+    // a granted viewer reads that form's data and still cannot write anywhere.
+    let resp = list_submissions(&app, &viewer, &form).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let stored: Vec<Submission> = json_body(resp).await;
+    assert_eq!(stored.len(), 1);
+    assert_eq!(submit(&app, &viewer, &form).await, StatusCode::FORBIDDEN);
+}
+
+// ---- submission ownership ----------------------------------------------
+//
+// `submissions.id` comes from the client and is unique across every form, so a
+// write that replaced an existing row would move that row, and the attachments
+// hanging off it, under a form the writer controls. Every per-form gate reads
+// authority out of that row, so these three cover the whole escape.
+
+#[tokio::test]
+async fn a_submission_id_already_on_file_cannot_be_taken_over() {
+    let (app, store, dir) = authz_app_with_dir().await;
+    let a = login(&app, EDITOR_A, TEST_PASSWORD).await;
+    let b = login(&app, EDITOR_B, TEST_PASSWORD).await;
+
+    let form_a = one_field_form("A's survey");
+    assert_eq!(create_form(&app, &a, &form_a).await, StatusCode::CREATED);
+    let victim = filled_submission(&form_a);
+    assert_eq!(
+        post_submission(&app, &a, &victim).await,
+        StatusCode::CREATED
+    );
+    let attachment = store_attachment(&store, &dir, victim.id, b"SECRET-PHOTO-BYTES").await;
+    let attachment_uri = format!("/api/v1/attachments/{attachment}");
+
+    // B owns a form of their own and files under it, reusing A's submission id.
+    let form_b = one_field_form("B's own form");
+    assert_eq!(create_form(&app, &b, &form_b).await, StatusCode::CREATED);
+    let mut hijack = filled_submission(&form_b);
+    hijack.id = victim.id;
+    assert_eq!(
+        post_submission(&app, &b, &hijack).await,
+        StatusCode::CONFLICT,
+        "an id already on file must be refused, not replaced"
+    );
+
+    // the attachment stayed with A's form, and its bytes never reached B.
+    assert_eq!(
+        app.clone()
+            .oneshot(get(&attachment_uri, &b))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let resp = app.clone().oneshot(get(&attachment_uri, &a)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_bytes(resp).await, b"SECRET-PHOTO-BYTES");
+
+    // and A's own row is untouched.
+    let resp = list_submissions(&app, &a, &form_a).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rows: Vec<Submission> = json_body(resp).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, victim.id);
+    assert_eq!(rows[0].form_id, form_a.id);
+    // B's form never received the row either, so the refusal dropped it.
+    let resp = list_submissions(&app, &b, &form_b).await;
+    let rows: Vec<Submission> = json_body(resp).await;
+    assert!(rows.is_empty());
+}
+
+#[tokio::test]
+async fn a_submission_body_cannot_name_a_form_other_than_the_one_in_the_path() {
+    let (app, _store) = authz_app().await;
+    let a = login(&app, EDITOR_A, TEST_PASSWORD).await;
+    let b = login(&app, EDITOR_B, TEST_PASSWORD).await;
+
+    let form_a = one_field_form("A's survey");
+    let form_b = one_field_form("B's own form");
+    assert_eq!(create_form(&app, &a, &form_a).await, StatusCode::CREATED);
+    assert_eq!(create_form(&app, &b, &form_b).await, StatusCode::CREATED);
+
+    // posted to B's own form, but the body claims A's. Validating against one
+    // form and filing under the other is refused rather than quietly corrected.
+    let mut planted = filled_submission(&form_b);
+    planted.form_id = form_a.id;
+    assert_eq!(
+        post_json_status(
+            &app,
+            &format!("/api/v1/forms/{}/submissions", form_b.id),
+            &b,
+            &planted
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+
+    let resp = list_submissions(&app, &a, &form_a).await;
+    let rows: Vec<Submission> = json_body(resp).await;
+    assert!(rows.is_empty(), "B's row must not land in A's form");
+}
+
+#[tokio::test]
+async fn a_revoked_grantee_cannot_reach_the_shared_forms_attachments_again() {
+    let (app, store, dir) = authz_app_with_dir().await;
+    let a = login(&app, EDITOR_A, TEST_PASSWORD).await;
+    let b = login(&app, EDITOR_B, TEST_PASSWORD).await;
+    let b_id = user_id(&store, EDITOR_B).await;
+
+    let shared = one_field_form("Shared");
+    assert_eq!(create_form(&app, &a, &shared).await, StatusCode::CREATED);
+    let submission = filled_submission(&shared);
+    assert_eq!(
+        post_submission(&app, &a, &submission).await,
+        StatusCode::CREATED
+    );
+    let attachment = store_attachment(&store, &dir, submission.id, b"SECRET-PHOTO-BYTES").await;
+    let attachment_uri = format!("/api/v1/attachments/{attachment}");
+
+    // A shares read, B harvests the ids the share hands over, A takes it back.
+    assert_eq!(
+        post_json_status(
+            &app,
+            &format!("/api/v1/forms/{}/grants", shared.id),
+            &a,
+            &serde_json::json!({ "user_id": b_id })
+        )
+        .await,
+        StatusCode::CREATED
+    );
+    let resp = list_submissions(&app, &b, &shared).await;
+    let seen: Vec<Submission> = json_body(resp).await;
+    let harvested = seen[0].id;
+    assert_eq!(
+        app.clone()
+            .oneshot(del(
+                &format!("/api/v1/forms/{}/grants/{}", shared.id, b_id),
+                &a,
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+
+    // re-filing the harvested id under a form of B's own buys nothing back.
+    let form_b = one_field_form("B's own form");
+    assert_eq!(create_form(&app, &b, &form_b).await, StatusCode::CREATED);
+    let mut hijack = filled_submission(&form_b);
+    hijack.id = harvested;
+    assert_eq!(
+        post_submission(&app, &b, &hijack).await,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(get(&attachment_uri, &b))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND,
+        "a revoked grant must not leave the attachment bytes reachable"
+    );
+
+    // and a read-only grant never became a delete on the grantor's data.
+    assert_eq!(
+        app.clone()
+            .oneshot(del(
+                &format!("/api/v1/forms/{}/submissions/{harvested}", form_b.id),
+                &b,
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let resp = list_submissions(&app, &a, &shared).await;
+    let rows: Vec<Submission> = json_body(resp).await;
+    assert_eq!(rows.len(), 1, "A's submission must survive");
+}
+
 fn urlencode(s: &str) -> String {
     s.replace('+', "%2B").replace(':', "%3A")
 }
@@ -799,6 +1419,29 @@ fn post_json<T: Serialize>(uri: &str, token: &str, value: &T) -> Request<Body> {
         .unwrap()
 }
 
+async fn post_json_status<T: Serialize>(
+    app: &axum::Router,
+    uri: &str,
+    token: &str,
+    value: &T,
+) -> StatusCode {
+    app.clone()
+        .oneshot(post_json(uri, token, value))
+        .await
+        .unwrap()
+        .status()
+}
+
+async fn post_submission(app: &axum::Router, token: &str, submission: &Submission) -> StatusCode {
+    post_json_status(
+        app,
+        &format!("/api/v1/forms/{}/submissions", submission.form_id),
+        token,
+        submission,
+    )
+    .await
+}
+
 fn get(uri: &str, token: &str) -> Request<Body> {
     let mut builder = Request::builder().uri(uri);
     if !token.is_empty() {
@@ -807,11 +1450,63 @@ fn get(uri: &str, token: &str) -> Request<Body> {
     builder.body(Body::empty()).unwrap()
 }
 
-async fn body_string(resp: Response) -> String {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+fn del(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Store an attachment the way the OpenRosa route does, since the JSON API has
+/// no upload of its own: bytes under `<data dir>/attachments/<submission>/`,
+/// metadata in the table.
+async fn store_attachment(
+    store: &Store,
+    dir: &tempfile::TempDir,
+    submission_id: Uuid,
+    bytes: &[u8],
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let directory =
+        collecta_server::openrosa::attachments_dir(dir.path()).join(submission_id.to_string());
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(id.to_string());
+    std::fs::write(&path, bytes).unwrap();
+    store
+        .add_attachment(&AttachmentRow {
+            id,
+            submission_id,
+            field_name: "photo".to_string(),
+            filename: "photo1.jpg".to_string(),
+            content_type: "image/jpeg".to_string(),
+            size_bytes: bytes.len() as u64,
+            storage_path: path.to_string_lossy().into_owned(),
+        })
         .await
         .unwrap();
-    String::from_utf8(bytes.to_vec()).unwrap()
+    id
+}
+
+fn header(resp: &Response, name: &str) -> String {
+    resp.headers()
+        .get(name)
+        .unwrap_or_else(|| panic!("response carries {name}"))
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn body_bytes(resp: Response) -> Vec<u8> {
+    axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec()
+}
+
+async fn body_string(resp: Response) -> String {
+    String::from_utf8(body_bytes(resp).await).unwrap()
 }
 
 async fn json_body<T: DeserializeOwned>(resp: Response) -> T {

@@ -27,10 +27,11 @@ It provides:
 
 ### Status
 
-**Working:** the Axum server, SQLite persistence, JWT auth with role and form-ownership
-checks, form CRUD, submission validation and ingestion, XLSForm import, the push/pull
-sync endpoints, and an OpenRosa compatibility layer that ODK Collect can submit to.
-All are covered by tests (`cargo test` runs 103).
+**Working:** the Axum server, SQLite persistence, JWT auth with role, form-ownership and
+per-form grant checks, form CRUD including deletes, submission validation and ingestion,
+attachment download, XLSForm import, the push/pull sync endpoints, and an OpenRosa
+compatibility layer that ODK Collect can submit to. All are covered by tests
+(`cargo test` runs 111).
 
 **Not built yet:**
 
@@ -38,14 +39,8 @@ All are covered by tests (`cargo test` runs 103).
   layer of our own; ODK Collect is the supported client. The `SyncQueue` and
   `AttachmentStore` types in `collecta-core` are there for a client author to use, and
   nothing in this repo uses them.
-- **No attachment download.** Attachments arrive over OpenRosa and are written to disk
-  and indexed, but there is no endpoint to read one back out. Files are on disk under
-  the data directory and in the `attachments` table.
-- **No deletes.** There are no tombstones and no delete endpoints for forms or
-  submissions, so sync cannot propagate a deletion.
-- **No per-form sharing.** Roles are instance-wide and a form's submissions are
-  readable by its creator and by admins. There is no grant table, so letting a second
-  account read one form's data is not expressible.
+- **No attachment sync.** Attachments can be uploaded over OpenRosa and downloaded over
+  the JSON API, but they are not part of the push/pull protocol.
 - **No Ptolemy integration.** Writing collected features through to the geodatabase is
   planned, not wired up.
 
@@ -121,14 +116,37 @@ A `collecta-core` library type for a client to drive. No client in this repo use
 | POST | `/api/v1/forms` | Create a form (JSON) | editor, admin |
 | POST | `/api/v1/forms/import` | Import an XLSForm (`.xlsx` request body) | editor, admin |
 | GET | `/api/v1/forms/{id}` | Get form schema | any account |
-| GET | `/api/v1/forms/{id}/submissions` | List submissions | form creator, admin |
+| DELETE | `/api/v1/forms/{id}` | Delete a form and everything collected under it | form creator, admin |
+| GET | `/api/v1/forms/{id}/submissions` | List submissions | creator, grantee, admin |
 | POST | `/api/v1/forms/{id}/submissions` | Submit data (validates against schema) | editor, admin |
+| DELETE | `/api/v1/forms/{id}/submissions/{sid}` | Delete one submission and its attachments | form creator, admin |
+| GET | `/api/v1/forms/{id}/grants` | List the accounts this form is shared with | form creator, admin |
+| POST | `/api/v1/forms/{id}/grants` | Share the form's data (`{"user_id": "<uuid>"}`) | form creator, admin |
+| DELETE | `/api/v1/forms/{id}/grants/{user_id}` | Withdraw a grant | form creator, admin |
+| GET | `/api/v1/attachments/{id}` | Download an attachment's bytes | creator, grantee, admin |
 | GET | `/api/v1/sync/status` | Get sync queue status (whole instance) | admin |
 | POST | `/api/v1/sync/push` | Batch-upload queued submissions (idempotent) | editor, admin |
-| GET | `/api/v1/sync/forms?since=<cursor>` | Form definitions updated since cursor | any account |
+| GET | `/api/v1/sync/forms?since=<cursor>` | Form definitions changed since cursor | any account |
 
-All endpoints except `/health` and login require `Authorization: Bearer <jwt>`. There is
-no delete endpoint. See [Authentication and roles](#authentication-and-roles).
+All endpoints except `/health` and login require `Authorization: Bearer <jwt>`. See
+[Authentication and roles](#authentication-and-roles).
+
+A submission carries its own id and names its form, both chosen by the client. The form in
+the path wins: a body naming a different one is a 400 rather than a silent correction. Ids
+are unique across every form and are never reused, so posting one already on file is a
+409, never an overwrite.
+
+Attachment ids come from the `attachments` list on each submission. The bytes are served
+under the content type they were uploaded with, but always as
+`Content-Disposition: attachment` with `X-Content-Type-Options: nosniff`, since that type
+came off a field device and must not be rendered as a page on this origin. An id the
+caller may not read answers 404 rather than 403, since nothing lists attachments to an
+account without read on their form and the id is the only thing protecting the bytes.
+
+Deleting a form leaves a tombstone the form pull hands to clients. Its submissions, their
+attachments (rows and files) and the grants on it are removed outright. Deleting a
+submission is a hard delete, since submissions only ever travel client to server. Writing
+a form under a deleted id clears the tombstone and brings the id back.
 
 ---
 
@@ -219,6 +237,18 @@ A form records who created it. Its submissions are readable by that account and 
 admins, and its id cannot be reused by anyone else. Forms created before roles were
 enforced have no creator, so only an admin can read their submissions.
 
+Beyond that, a form's creator (or an admin) can grant another account read on that one
+form with `POST /api/v1/forms/{id}/grants`. A grant covers the form's submissions and
+their attachments and nothing else: a grantee cannot delete the form or its data, cannot
+re-share it, and cannot list who else holds a grant. Grants are per form, so they do not
+widen what the account reaches anywhere else, and they disappear with the form.
+
+A grant is read-only in both directions, which depends on submission ids being unclaimable
+rather than on the grant check alone. A grantee sees the ids of the submissions and
+attachments they may read, so if refiling one of those ids under a form of their own were
+allowed, it would carry that row and its attachments into a form they control and survive
+the revoke. That is why an id already on file is refused rather than replaced.
+
 Any other role string is refused everywhere rather than treated as the weakest role,
 so an account carrying one can log in and do nothing. `create-user` rejects it.
 
@@ -245,20 +275,27 @@ directions:
   a batch never duplicates rows), or `error` with a message (validation failure,
   unknown form). `SyncQueue::build_push_request` / `apply_push_response` implement
   the client side over the shared `sync_protocol` wire types.
-- `GET /api/v1/sync/forms?since=<cursor>` returns form definitions updated after
-  the cursor plus the next cursor; omit `since` for a full refresh. The cursor is
-  opaque (currently `<rfc3339>@<rowid>`) — store and echo it back url-encoded.
+- `GET /api/v1/sync/forms?since=<cursor>` returns form definitions changed after
+  the cursor, the ids of the forms deleted since it (`deleted`), and the next cursor.
+  Omit `since` for a full refresh. The cursor is opaque (currently
+  `<rfc3339>@<rowid>`), so store it and echo it back url-encoded.
 
-Deletion does not sync. There are no tombstones, so a form or submission removed on
-one side stays on the other. Attachments are not part of the protocol.
+A deleted form keeps its row as the tombstone, so deletes ride the same cursor as edits
+and a client pulling in order cannot receive a form after the delete that removed it. A
+client that has been away longer than it takes to delete a form still gets the tombstone,
+since nothing prunes them. Submission deletes do not sync: submissions only travel client
+to server, so there is no pull that could hand one back. Attachments are not part of the
+protocol.
 
 ---
 
 ## Persistence
 
 Server state is stored in SQLite (`forms`, `submissions`, `sync_queue`, `users`,
-`attachments` tables), so forms and submissions survive restarts. Attachment bytes
-live on disk under the data directory; the table holds their metadata and paths.
+`attachments`, `form_grants` tables), so forms and submissions survive restarts.
+Attachment bytes live on disk under the data directory, and the table holds their
+metadata and paths. A deleted form keeps its `forms` row with `deleted_at` set, both the
+tombstone and what hides it from every read path.
 
 Environment variables:
 
