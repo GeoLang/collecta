@@ -1,4 +1,5 @@
 /target
+.claude/
 # default COLLECTA_DB path and its sqlite sidecars
 /collecta.db
 /collecta.db-*
