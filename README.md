@@ -136,6 +136,12 @@ the path wins: a body naming a different one is a 400 rather than a silent corre
 are unique across every form and are never reused, so posting one already on file is a
 409, never an overwrite.
 
+The submitter is not client-chosen. Both `POST /api/v1/forms/{id}/submissions` and
+`POST /api/v1/sync/push` overwrite `collector_id` with the account the token names, so a
+body claiming someone else is ignored, and a pushed batch is filed under the account that
+pushed it. Submissions stored before this was recorded have `collector_id: null` and are
+not backfilled to anyone.
+
 Attachment ids come from the `attachments` list on each submission. The bytes are served
 under the content type they were uploaded with, but always as
 `Content-Disposition: attachment` with `X-Content-Type-Options: nosniff`, since that type

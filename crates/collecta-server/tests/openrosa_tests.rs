@@ -697,7 +697,14 @@ async fn submission_becomes_typed_field_values() {
         Some(&FieldValue::Text("1553025782376.jpg".into()))
     );
     // the authenticated user is recorded, not anything the client claimed.
-    assert!(stored[0].collector_id.is_some());
+    let submitter = store
+        .get_user_by_email(TEST_EMAIL)
+        .await
+        .unwrap()
+        .unwrap()
+        .id
+        .to_string();
+    assert_eq!(stored[0].collector_id.as_deref(), Some(submitter.as_str()));
 }
 
 #[tokio::test]

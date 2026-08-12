@@ -13,6 +13,10 @@
 //! but a form's submissions are only readable by whoever created the form, by
 //! an admin, and by any account the creator granted read on that one form.
 //!
+//! Every accepted submission carries the account that filed it in its
+//! `collector_id`, taken from the caller's credentials on both surfaces. A row
+//! without one predates the recording; nothing stored since can lack it.
+//!
 //! [`openrosa`] adds a second, Basic-authenticated surface at the server root
 //! for ODK Collect. The two share the users table and nothing else.
 
@@ -271,6 +275,14 @@ async fn require_owner(state: &AppState, caller: &Caller, form_id: Uuid) -> Resu
     Err(ApiError(StatusCode::FORBIDDEN, "not your form".to_string()))
 }
 
+/// Record who filed a submission, overwriting whatever the body claimed.
+///
+/// The token's subject is the only thing that can be evidence here: a
+/// `collector_id` the client chose would let one account file data as another.
+fn record_submitter(submission: &mut Submission, caller: &Caller) {
+    submission.collector_id = Some(caller.id.to_string());
+}
+
 /// File one submission against the form named in the path.
 ///
 /// The path is authoritative: a body naming a different form is refused rather
@@ -279,7 +291,8 @@ async fn require_owner(state: &AppState, caller: &Caller, form_id: Uuid) -> Resu
 async fn submit(
     State(state): State<AppState>,
     Path(form_id): Path<Uuid>,
-    Json(submission): Json<Submission>,
+    Extension(caller): Extension<Caller>,
+    Json(mut submission): Json<Submission>,
 ) -> Result<(StatusCode, Json<IdResponse>), ApiError> {
     if submission.form_id != form_id {
         return Err(ApiError(
@@ -287,6 +300,7 @@ async fn submit(
             "submission form_id does not match the form in the path".to_string(),
         ));
     }
+    record_submitter(&mut submission, &caller);
     let form = state
         .store
         .get_form(form_id)
@@ -482,12 +496,18 @@ async fn sync_status(State(state): State<AppState>) -> Result<Json<SyncStatusRes
 
 /// Batch upload of queued submissions, idempotent on submission id.
 /// Items are processed independently; each gets its own result.
+///
+/// Every item is filed under the pushing account, whatever the device recorded
+/// while offline: a batch arrives over one authenticated connection, so that is
+/// the only identity this server can vouch for.
 async fn sync_push(
     State(state): State<AppState>,
-    Json(request): Json<PushRequest>,
+    Extension(caller): Extension<Caller>,
+    Json(mut request): Json<PushRequest>,
 ) -> Result<Json<PushResponse>, ApiError> {
     let mut results = Vec::with_capacity(request.submissions.len());
-    for submission in &request.submissions {
+    for submission in &mut request.submissions {
+        record_submitter(submission, &caller);
         results.push(push_one(&state.store, submission).await);
     }
     Ok(Json(PushResponse { results }))

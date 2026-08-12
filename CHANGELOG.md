@@ -53,6 +53,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   meaning that id was already taken.
 
 ### Security
+- The JSON API records who filed a submission (2026-08-11). `POST
+  /api/v1/forms/{id}/submissions` and `POST /api/v1/sync/push` stored the
+  `collector_id` from the request body, so submissions arrived with no submitter
+  at all or with one the client picked, including another account's id. Both
+  routes now overwrite it with the caller's token subject, the same identity the
+  OpenRosa route already recorded. A batch push is filed under the pushing
+  account, since that is the only identity behind the connection. Rows stored
+  before this keep a null `collector_id` and are not backfilled: no submission
+  path is open without credentials, so null means nobody recorded a submitter
+  rather than that nobody submitted it.
 - Submission ids are no longer claimable (2026-08-02). The JSON submit route
   wrote the client's submission with a replace on an id that is client-chosen
   and unique across every form, so an account that had seen a

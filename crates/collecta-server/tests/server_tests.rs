@@ -1307,6 +1307,80 @@ async fn a_submission_body_cannot_name_a_form_other_than_the_one_in_the_path() {
 }
 
 #[tokio::test]
+async fn a_submission_records_the_caller_not_what_the_body_claims() {
+    let (app, store) = authz_app().await;
+    let a = login(&app, EDITOR_A, TEST_PASSWORD).await;
+    let b = login(&app, EDITOR_B, TEST_PASSWORD).await;
+    let a_id = user_id(&store, EDITOR_A).await;
+    let b_id = user_id(&store, EDITOR_B).await;
+
+    let form = one_field_form("A's survey");
+    assert_eq!(create_form(&app, &a, &form).await, StatusCode::CREATED);
+
+    // B files against A's form, on both ingest paths, claiming to be A.
+    let mut posted = filled_submission(&form);
+    posted.collector_id = Some(a_id.to_string());
+    assert_eq!(
+        post_submission(&app, &b, &posted).await,
+        StatusCode::CREATED
+    );
+
+    let mut pushed = filled_submission(&form);
+    pushed.collector_id = Some(a_id.to_string());
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/api/v1/sync/push",
+            &b,
+            &PushRequest {
+                submissions: vec![pushed.clone()],
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // and nothing can be filed without a caller to record.
+    assert_eq!(
+        post_submission(&app, "", &filled_submission(&form)).await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    let resp = list_submissions(&app, &a, &form).await;
+    let rows: Vec<Submission> = json_body(resp).await;
+    let submitters: Vec<_> = rows
+        .iter()
+        .map(|r| (r.id, r.collector_id.clone()))
+        .collect();
+    assert_eq!(
+        submitters,
+        vec![
+            (posted.id, Some(b_id.to_string())),
+            (pushed.id, Some(b_id.to_string())),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_row_from_before_submitters_were_recorded_reads_as_no_submitter() {
+    let (app, store) = authz_app().await;
+    let a = login(&app, EDITOR_A, TEST_PASSWORD).await;
+
+    let form = one_field_form("A's survey");
+    assert_eq!(create_form(&app, &a, &form).await, StatusCode::CREATED);
+    // what the old handler stored: the posted body, submitter field and all.
+    let legacy = filled_submission(&form);
+    assert!(store.insert_submission(&legacy).await.unwrap());
+
+    let resp = list_submissions(&app, &a, &form).await;
+    let rows: Vec<serde_json::Value> = json_body(resp).await;
+    assert_eq!(rows.len(), 1);
+    // null, never an account: a reader can tell "nobody recorded one" from a
+    // row that names someone, and no backfill invents an owner for it.
+    assert_eq!(rows[0]["collector_id"], serde_json::Value::Null);
+}
+
+#[tokio::test]
 async fn a_revoked_grantee_cannot_reach_the_shared_forms_attachments_again() {
     let (app, store, dir) = authz_app_with_dir().await;
     let a = login(&app, EDITOR_A, TEST_PASSWORD).await;

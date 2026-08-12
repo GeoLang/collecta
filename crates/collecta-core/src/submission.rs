@@ -26,7 +26,8 @@ pub struct Submission {
     pub completed_at: Option<DateTime<Utc>>,
     /// Device GPS location at time of submission.
     pub device_location: Option<GeoPoint>,
-    /// Collecting user/device identifier.
+    /// Account that filed this, which the server overwrites with the
+    /// authenticated caller on ingest. `None` means none was ever recorded.
     pub collector_id: Option<String>,
     /// Submission status.
     pub status: SubmissionStatus,
