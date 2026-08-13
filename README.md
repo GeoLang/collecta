@@ -31,7 +31,7 @@ It provides:
 per-form grant checks, form CRUD including deletes, submission validation and ingestion,
 attachment download, XLSForm import, the push/pull sync endpoints, and an OpenRosa
 compatibility layer that ODK Collect can submit to. All are covered by tests
-(`cargo test` runs 111).
+(`cargo test` runs 117).
 
 **Not built yet:**
 
@@ -142,10 +142,15 @@ body claiming someone else is ignored, and a pushed batch is filed under the acc
 pushed it. Submissions stored before this was recorded have `collector_id: null` and are
 not backfilled to anyone.
 
-Attachment ids come from the `attachments` list on each submission. The bytes are served
-under the content type they were uploaded with, but always as
-`Content-Disposition: attachment` with `X-Content-Type-Options: nosniff`, since that type
-came off a field device and must not be rendered as a page on this origin. An id the
+Attachment ids come from the `attachments` list on each submission. The bytes come back
+under a content type collecta chose, not the one the device claimed: a capture format
+(`image/jpeg`, `image/png`, `image/webp`, `image/heic`, `audio/3gpp`, `audio/aac`,
+`audio/mp4`, `audio/mpeg`, `audio/ogg`, `audio/wav`, `video/3gpp`, `video/mp4`,
+`video/quicktime`, `video/webm`, `application/pdf`) is kept, and everything else, markup
+and scripts included, is recorded and served as `application/octet-stream`. The bytes
+themselves are stored whole either way. On top of that every response is
+`Content-Disposition: attachment` with `X-Content-Type-Options: nosniff`, so an upload
+can never be rendered as a page on this origin. An id the
 caller may not read answers 404 rather than 403, since nothing lists attachments to an
 account without read on their form and the id is the only thing protecting the bytes.
 
@@ -213,9 +218,11 @@ several POSTs, repeating the identical instance XML each time, so:
 
 Attachments are written to `<data dir>/attachments/<submission uuid>/<attachment
 uuid>`. Both path components are server-generated UUIDs; the client's file name is
-recorded as metadata only and never becomes a path component. Parts are capped at
-50 MB each (the advertised `X-OpenRosa-Accept-Content-Length`) with a slightly larger
-whole-request cap; oversized requests get 413.
+recorded as metadata only and never becomes a path component. The part's content type is
+narrowed to a capture format or to `application/octet-stream` on the way in, so the
+recorded type is always one collecta chose. Parts are capped at 50 MB each (the advertised
+`X-OpenRosa-Accept-Content-Length`) with a slightly larger whole-request cap; oversized
+requests get 413.
 
 **Not supported:** form manifests and external media (`manifestUrl` is not emitted),
 `listAllVersions`, `verbose` descriptions, entity lists, encrypted forms, Digest auth,

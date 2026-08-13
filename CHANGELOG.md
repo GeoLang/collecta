@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Attachment content type policy (2026-08-13): an upload keeps its claimed type
+  only when that type is a capture format (jpeg, png, webp, heic, the common
+  audio and video containers, pdf). Everything else, markup and scripts
+  included, is recorded and served as `application/octet-stream`, so no upload
+  can pick the type it comes back under. The bytes are stored whole either way,
+  and the narrowing runs again on the way out, so rows written before it are
+  covered too.
 - Attachment download (2026-08-02): `GET /api/v1/attachments/{id}` serves the
   stored bytes under their recorded content type, to whoever may read the
   submission they hang off. Always `Content-Disposition: attachment` with

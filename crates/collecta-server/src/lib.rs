@@ -20,6 +20,7 @@
 //! [`openrosa`] adds a second, Basic-authenticated surface at the server root
 //! for ODK Collect. The two share the users table and nothing else.
 
+pub mod attachment;
 pub mod auth;
 pub mod openrosa;
 pub mod store;
@@ -382,9 +383,9 @@ async fn remove_attachment_files(state: &AppState, submission_id: Uuid) {
 /// Bytes of one stored attachment, readable by whoever may read the submission
 /// it hangs off.
 ///
-/// Served as a download rather than inline: the content type and file name came
-/// from the device that uploaded them, so a crafted html attachment must not be
-/// rendered as a page on this origin.
+/// Served as a download rather than inline, under a type from
+/// [`attachment::recorded_content_type`] rather than the one the device claimed,
+/// so a crafted html upload can never be rendered as a page on this origin.
 async fn get_attachment(
     State(state): State<AppState>,
     Extension(caller): Extension<Caller>,
@@ -415,10 +416,11 @@ async fn get_attachment(
                 "attachment bytes are missing".to_string(),
             )
         })?;
-    // the stored type is client-supplied, so anything unusable as a header value
-    // falls back rather than failing the read.
-    let content_type = HeaderValue::from_str(&stored.attachment.content_type)
-        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    // re-applied on the way out, so a row stored before the policy existed is
+    // served under it too.
+    let content_type = HeaderValue::from_static(attachment::recorded_content_type(
+        &stored.attachment.content_type,
+    ));
     let headers = [
         (CONTENT_TYPE, content_type),
         (CONTENT_DISPOSITION, HeaderValue::from_static("attachment")),

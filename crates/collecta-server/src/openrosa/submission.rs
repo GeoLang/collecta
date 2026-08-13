@@ -225,7 +225,8 @@ async fn read_capped(mut field: Field<'_>) -> Result<Vec<u8>, OpenRosaError> {
 /// uuid>`. Both components are [`Uuid`]s this server generated, so the path is
 /// traversal-proof by construction rather than by sanitising: no client-supplied
 /// string is ever a path component. The client's file name is recorded in the
-/// `filename` column and used only for matching resent parts.
+/// `filename` column and used only for matching resent parts, and its claimed
+/// content type is narrowed by [`crate::attachment::recorded_content_type`].
 async fn store_attachments(
     state: &AppState,
     submission_id: Uuid,
@@ -274,7 +275,8 @@ async fn store_attachments(
                 submission_id,
                 field_name,
                 filename: client_name,
-                content_type: attachment.content_type.clone(),
+                content_type: crate::attachment::recorded_content_type(&attachment.content_type)
+                    .to_string(),
                 size_bytes: attachment.bytes.len() as u64,
                 storage_path: path.to_string_lossy().into_owned(),
             })

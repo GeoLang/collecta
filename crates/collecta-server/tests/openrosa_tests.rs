@@ -9,17 +9,20 @@ use axum::response::Response;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use collecta_core::form::{Choice, FieldType, Form, FormField};
-use collecta_core::submission::{FieldValue, GeoPoint};
+use collecta_core::submission::{FieldValue, GeoPoint, Submission};
+use collecta_server::auth::TokenResponse;
 use collecta_server::openrosa::xform;
 use collecta_server::store::{FormWriter, Store, UserRecord};
 use collecta_server::{Config, router};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
+use serde::de::DeserializeOwned;
 use tower::ServiceExt;
 use uuid::Uuid;
 
 const TEST_SECRET: &str = "test-secret-0123456789abcdef0123456789abcdef";
 const TEST_EMAIL: &str = "collector@example.com";
+const OTHER_EMAIL: &str = "unrelated@example.com";
 const TEST_PASSWORD: &str = "correct horse battery staple";
 
 // ---- xform rendering ---------------------------------------------------
@@ -1319,6 +1322,124 @@ async fn a_request_over_the_total_body_limit_is_413_not_400() {
 }
 
 #[tokio::test]
+async fn an_uploaded_attachment_reads_back_to_whoever_may_read_the_submission() {
+    let (app, form, _store, _dir) = app_with_owned_form().await;
+    let xml = instance_xml(
+        form.id,
+        "uuid:aaaa1111-0000-0000-0000-000000000008",
+        "<q_text>Alpha</q_text><q_photo>photo1.jpg</q_photo>",
+    );
+    let resp = post_submission(
+        &app,
+        &[
+            instance_part(&xml),
+            part(
+                "photo1.jpg",
+                Some("photo1.jpg"),
+                "image/jpeg; charset=binary",
+                b"JPEGBYTES".to_vec(),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // reading the submission is how a client learns the attachment id.
+    let owner = login(&app, TEST_EMAIL).await;
+    let submissions = format!("/api/v1/forms/{}/submissions", form.id);
+    let resp = app
+        .clone()
+        .oneshot(bearer(&submissions, &owner))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let filed: Vec<Submission> = json_body(resp).await;
+    let attachment = filed[0]
+        .attachments
+        .first()
+        .expect("the submission lists the uploaded file");
+    assert_eq!(attachment.field_name, "q_photo");
+    assert_eq!(attachment.filename, "photo1.jpg");
+    assert_eq!(attachment.size_bytes, 9);
+    // the parameter the device sent is dropped, the media type survives.
+    assert_eq!(attachment.mime_type, "image/jpeg");
+
+    let uri = format!("/api/v1/attachments/{}", attachment.id);
+    let resp = app.clone().oneshot(bearer(&uri, &owner)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header(&resp, "content-type"), "image/jpeg");
+    assert_eq!(header(&resp, "content-disposition"), "attachment");
+    assert_eq!(header(&resp, "x-content-type-options"), "nosniff");
+    assert_eq!(body_bytes(resp).await, b"JPEGBYTES");
+
+    // an account that cannot read the submission cannot read its bytes, and is
+    // told what an id nobody stored would be told.
+    let other = login(&app, OTHER_EMAIL).await;
+    let resp = app
+        .clone()
+        .oneshot(bearer(&submissions, &other))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = app.clone().oneshot(bearer(&uri, &other)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // and the basic credentials that uploaded it are not a json api session.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", &uri, TEST_EMAIL, TEST_PASSWORD))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn an_upload_claiming_a_type_a_browser_runs_is_served_as_opaque_bytes() {
+    let (app, form, store, _dir) = app_with_owned_form().await;
+    let xml = instance_xml(
+        form.id,
+        "uuid:aaaa1111-0000-0000-0000-000000000009",
+        "<q_text>Alpha</q_text><q_file>notes.html</q_file>",
+    );
+    let payload = b"<script>alert(1)</script>".to_vec();
+    let resp = post_submission(
+        &app,
+        &[
+            instance_part(&xml),
+            part(
+                "notes.html",
+                Some("notes.html"),
+                "text/html",
+                payload.clone(),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let filed = store.list_submissions(form.id).await.unwrap();
+    let attachments = store.list_attachments(filed[0].id).await.unwrap();
+    assert_eq!(
+        attachments[0].content_type, "application/octet-stream",
+        "a claimed type this server will not serve must not be recorded"
+    );
+    // the bytes are kept whole; only the type they come back under is narrowed.
+    assert_eq!(
+        std::fs::read(&attachments[0].storage_path).unwrap(),
+        payload
+    );
+
+    let owner = login(&app, TEST_EMAIL).await;
+    let uri = format!("/api/v1/attachments/{}", attachments[0].id);
+    let resp = app.clone().oneshot(bearer(&uri, &owner)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header(&resp, "content-type"), "application/octet-stream");
+    assert_eq!(header(&resp, "content-disposition"), "attachment");
+    assert_eq!(header(&resp, "x-content-type-options"), "nosniff");
+    assert_eq!(body_bytes(resp).await, payload);
+}
+
+#[tokio::test]
 async fn the_same_instance_id_on_a_different_form_is_a_separate_submission() {
     let (app, form, store, _dir) = app_parts_with_dir().await;
 
@@ -1424,15 +1545,7 @@ async fn app_parts() -> (axum::Router, Form, Store) {
 /// tests can assert on what was actually persisted rather than on the response.
 async fn app_parts_with_dir() -> (axum::Router, Form, Store, tempfile::TempDir) {
     let store = Store::connect(":memory:").await.unwrap();
-    store
-        .create_user(&UserRecord {
-            id: Uuid::new_v4(),
-            email: TEST_EMAIL.to_string(),
-            password_hash: collecta_server::auth::hash_password(TEST_PASSWORD),
-            role: "editor".to_string(),
-        })
-        .await
-        .unwrap();
+    create_editor(&store, TEST_EMAIL).await;
     let form = kitchen_sink_form();
     store
         .insert_form(&form, FormWriter::system())
@@ -1443,6 +1556,66 @@ async fn app_parts_with_dir() -> (axum::Router, Form, Store, tempfile::TempDir) 
     let mut config = Config::new(TEST_SECRET, dir.path());
     config.base_url = Some("http://collecta.test".to_string());
     (router(store.clone(), config), form, store, dir)
+}
+
+/// The same app with the form created by [`TEST_EMAIL`] rather than seeded, and
+/// a second editor who has nothing to do with it. Ownership is what the JSON
+/// API's read gate compares against, so a file posted over OpenRosa can be read
+/// back there.
+async fn app_with_owned_form() -> (axum::Router, Form, Store, tempfile::TempDir) {
+    let store = Store::connect(":memory:").await.unwrap();
+    let owner = create_editor(&store, TEST_EMAIL).await;
+    create_editor(&store, OTHER_EMAIL).await;
+    let form = kitchen_sink_form();
+    store
+        .insert_form(
+            &form,
+            FormWriter {
+                id: Some(owner),
+                overwrite_any: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::new(TEST_SECRET, dir.path());
+    (router(store.clone(), config), form, store, dir)
+}
+
+async fn create_editor(store: &Store, email: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    store
+        .create_user(&UserRecord {
+            id,
+            email: email.to_string(),
+            password_hash: collecta_server::auth::hash_password(TEST_PASSWORD),
+            role: "editor".to_string(),
+        })
+        .await
+        .unwrap();
+    id
+}
+
+async fn login(app: &axum::Router, email: &str) -> String {
+    let credentials = serde_json::json!({ "email": email, "password": TEST_PASSWORD });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/login")
+        .header("content-type", "application/json")
+        .body(Body::from(credentials.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    json_body::<TokenResponse>(resp).await.token
+}
+
+fn bearer(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
 }
 
 fn authed(method: &str, uri: &str, email: &str, password: &str) -> Request<Body> {
@@ -1549,11 +1722,28 @@ fn minimal_instance(form_id: Uuid, instance_id: &str) -> String {
     instance_xml(form_id, instance_id, "<q_text>Alpha</q_text>")
 }
 
-async fn body_string(resp: Response) -> String {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+async fn body_bytes(resp: Response) -> Vec<u8> {
+    axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
-        .unwrap();
-    String::from_utf8(bytes.to_vec()).unwrap()
+        .unwrap()
+        .to_vec()
+}
+
+async fn body_string(resp: Response) -> String {
+    String::from_utf8(body_bytes(resp).await).unwrap()
+}
+
+async fn json_body<T: DeserializeOwned>(resp: Response) -> T {
+    serde_json::from_str(&body_string(resp).await).unwrap()
+}
+
+fn header(resp: &Response, name: &str) -> String {
+    resp.headers()
+        .get(name)
+        .unwrap_or_else(|| panic!("response carries {name}"))
+        .to_str()
+        .unwrap()
+        .to_string()
 }
 
 // ---- a tiny xml model, so assertions run against parsed output ----------
