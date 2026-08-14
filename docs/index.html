@@ -47,7 +47,8 @@ footer{padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
 <div class="grid">
 <div class="card"><h3>📝 Form Schemas</h3><p>20+ field types with conditional logic, validation constraints, and XLSForm-compatible structure.</p></div>
 <div class="card"><h3>📡 Sync Protocol</h3><p>Idempotent submission push and cursor-based form pull. A <code>SyncQueue</code> library type with exponential backoff retry is provided for a client to drive.</p></div>
-<div class="card"><h3>📎 Attachments (deferred)</h3><p>Photo, audio, video, signature, and barcode exist as form field types, and an <code>Attachment</code> struct exists in the core library. The server has no upload endpoint and no blob storage, so nothing captures a photo today.</p></div>
+<div class="card"><h3>📎 Attachments</h3><p>Photo, audio, video, signature, and barcode parts arrive as multipart parts on the OpenRosa submission endpoint, are stored on disk, and download from <code>/api/v1/attachments/{id}</code>.</p></div>
+<div class="card"><h3>📱 OpenRosa</h3><p>formList, form.xml, and multipart submission endpoints with a Basic auth challenge, so ODK Collect works as the field client today.</p></div>
 <div class="card"><h3>🌍 GPS Field Types</h3><p>Point, trace, and shape geometry types in the form model, with latitude, longitude, altitude, and accuracy. Capture happens in the client.</p></div>
 <div class="card"><h3>✅ Validation</h3><p>Required fields, numeric range checks, text length, glob-style patterns, and OneOf sets. All errors are reported, not just the first.</p></div>
 <div class="card"><h3>🔌 REST API</h3><p>Axum server for form CRUD, XLSForm import, submission ingestion, and sync, persisted to SQLite. JWT auth with argon2id hashing.</p></div>
@@ -66,10 +67,10 @@ footer{padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
 <tr><td>JWT auth, argon2id hashing, admin-seeded users</td><td>Working</td></tr>
 <tr><td>Sync push and cursor-based form pull</td><td>Working</td></tr>
 <tr><td>XLSForm import</td><td>Working, expressions carried as metadata but not evaluated</td></tr>
-<tr><td>Mobile or desktop client</td><td>Not built, no client and no FFI layer</td></tr>
-<tr><td>Media attachment capture and upload</td><td>Deferred, no endpoint and no blob storage</td></tr>
-<tr><td>Deletes and tombstones in sync</td><td>Not implemented</td></tr>
-<tr><td>Role-based authorization</td><td>Not implemented, the role claim is not checked</td></tr>
+<tr><td>Mobile or desktop client</td><td>Not built, ODK Collect works against the OpenRosa endpoints</td></tr>
+<tr><td>Media attachment upload and download</td><td>Working, OpenRosa multipart upload to disk, authenticated download endpoint</td></tr>
+<tr><td>Deletes and tombstones in sync</td><td>Working, deleted forms surface as tombstones on the sync cursor</td></tr>
+<tr><td>Role-based authorization</td><td>Working, admin/editor/viewer enforced in middleware, unknown roles fail closed</td></tr>
 <tr><td>Ptolemy geodatabase integration</td><td>Planned, not wired up</td></tr>
 </table>
 </div>
