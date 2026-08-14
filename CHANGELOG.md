@@ -7,7 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Docs page brought current (2026-08-14): attachments, tombstones, role
+  enforcement and the OpenRosa layer were still listed as missing on
+  docs/index.html after all four shipped. The README's ViewTopia row now says
+  no integration exists yet, which is the case.
+
 ### Added
+- Platform deployment (2026-08-14): a Dockerfile on the fenestra pattern
+  (non-root, /data volume for the sqlite database and attachment blobs,
+  /health healthcheck), wired into viewtopia's platform compose behind an
+  nginx /collecta/ route. Platform JWTs verify directly, since the claims
+  convention already matches tiletopia's. `COLLECTA_JWT_SECRET` now treats an
+  empty value as unset and refuses to start, because compose `${VAR:-}`
+  interpolation hands an unset variable through as an empty string, which
+  would have meant tokens signed with an empty secret.
 - Attachment content type policy (2026-08-13): an upload keeps its claimed type
   only when that type is a capture format (jpeg, png, webp, heic, the common
   audio and video containers, pdf). Everything else, markup and scripts

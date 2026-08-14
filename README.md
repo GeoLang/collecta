@@ -315,7 +315,8 @@ Environment variables:
 - `COLLECTA_DB` — database path (default `./collecta.db`; `:memory:` for ephemeral)
 - `COLLECTA_ADDR` — listen address (default `0.0.0.0:3000`)
 - `COLLECTA_JWT_SECRET` — JWT signing secret, required, at least 32 bytes
-  (e.g. `openssl rand -hex 32`); the server refuses to start without it
+  (e.g. `openssl rand -hex 32`); the server refuses to start without it, and an
+  empty value counts as unset
 - `COLLECTA_DATA_DIR` — root for attachment blobs (default `./collecta-data`)
 - `COLLECTA_BASE_URL` — absolute origin advertised in OpenRosa `downloadUrl`s
   (e.g. `https://collect.example.org`). Unset, it is derived from each request's
@@ -410,7 +411,7 @@ curl -X POST http://localhost:3000/api/v1/forms \
 | [TerraVista](https://github.com/GeoLang/terravista) | Map engine core for a future field app |
 | [Ptolemy](https://github.com/GeoLang/ptolemy) | Geodatabase backend for collected features |
 | [GeoGit](https://github.com/GeoLang/geogit) | Version control for collected datasets |
-| [ViewTopia](https://github.com/GeoLang/viewtopia) | Web viewer for submitted data |
+| [ViewTopia](https://github.com/GeoLang/viewtopia) | Field Data panel lists forms and loads submissions as a map layer |
 | [GeoKode](https://github.com/GeoLang/geokode) | Reverse geocode submission locations |
 
 ---

@@ -147,11 +147,14 @@ pub async fn app() -> Router {
     router(store, config_from_env())
 }
 
-/// Read [`Config`] from the environment. Panics when the JWT secret is absent:
-/// there is no unauthenticated fallback mode.
+/// Read [`Config`] from the environment. Panics when the JWT secret is absent
+/// or empty: there is no unauthenticated fallback mode, and compose-style
+/// `${VAR:-}` interpolation hands an unset variable through as empty.
 pub fn config_from_env() -> Config {
     Config {
         jwt_secret: std::env::var("COLLECTA_JWT_SECRET")
+            .ok()
+            .filter(|secret| !secret.is_empty())
             .expect("COLLECTA_JWT_SECRET must be set (32+ random bytes)"),
         data_dir: std::env::var("COLLECTA_DATA_DIR")
             .unwrap_or_else(|_| "./collecta-data".to_string())
