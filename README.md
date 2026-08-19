@@ -81,9 +81,12 @@ The top and bottom layers are the target design. Only the two middle layers,
 
 - **20+ field types**: Text, Integer, Decimal, Date, DateTime, Time, Select, MultiSelect, GeoPoint, GeoTrace, GeoShape, Photo, Audio, Video, File, Barcode, Signature, Boolean, Repeat, Note
 - **Validation constraints**: Min/Max value, Min/Max length, glob-style pattern, OneOf
-- **Conditional visibility**: Show/hide fields based on other field values
-- **Repeat groups**: Nested sub-forms for multiple entries (e.g., "list all items inspected")
-- **Default values**: Pre-fill fields with constants or calculated values
+- **Conditional visibility**: only over the XLSForm path, where the raw `relevant`
+  expression is carried as metadata into the XForm bind and evaluated on the device by
+  ODK Collect. The form model's own `Condition` type is not read by anything.
+- **Repeat groups**: Nested sub-forms for multiple entries (e.g., "list all items
+  inspected"). They round-trip through the model, the XForm renderer and the submission
+  parser, but validation does not descend into them.
 - **Help text**: Per-field hints for data collectors
 
 ### Offline Sync Queue
@@ -93,7 +96,7 @@ A `collecta-core` library type for a client to drive. No client in this repo use
 - **Queue submissions locally** so collection does not need connectivity
 - **Exponential backoff retry**: 5s → 10s → 20s → 40s → ... capped at 5min
 - **Max retries** with permanent failure status after threshold
-- **Status tracking**: Pending, InProgress, Synced, Failed, Abandoned
+- **Status tracking**: Pending, Synced, Failed, Abandoned
 - Submissions only. Attachment sync is not implemented on either side.
 
 ### Validation Engine
@@ -105,6 +108,11 @@ A `collecta-core` library type for a client to drive. No client in this repo use
 - OneOf constraint (value must be from allowed set)
 - Unknown field detection
 - Full error reporting (all errors returned, not just first)
+
+All of it applies to top-level fields only. Validation does not recurse into a repeat's
+children, so a required field inside a repeat is not enforced. Defaults are not applied
+either: a field's `default` is imported and stored, but nothing substitutes it on ingest
+and the XForm renderer emits empty instance nodes, so it never reaches Collect.
 
 ### REST API
 
@@ -124,7 +132,7 @@ A `collecta-core` library type for a client to drive. No client in this repo use
 | POST | `/api/v1/forms/{id}/grants` | Share the form's data (`{"user_id": "<uuid>"}`) | form creator, admin |
 | DELETE | `/api/v1/forms/{id}/grants/{user_id}` | Withdraw a grant | form creator, admin |
 | GET | `/api/v1/attachments/{id}` | Download an attachment's bytes | creator, grantee, admin |
-| GET | `/api/v1/sync/status` | Get sync queue status (whole instance) | admin |
+| GET | `/api/v1/sync/status` | Count of submissions received (whole instance) | admin |
 | POST | `/api/v1/sync/push` | Batch-upload queued submissions (idempotent) | editor, admin |
 | GET | `/api/v1/sync/forms?since=<cursor>` | Form definitions changed since cursor | any account |
 
@@ -133,8 +141,8 @@ All endpoints except `/health` and login require `Authorization: Bearer <jwt>`. 
 
 A submission carries its own id and names its form, both chosen by the client. The form in
 the path wins: a body naming a different one is a 400 rather than a silent correction. Ids
-are unique across every form and are never reused, so posting one already on file is a
-409, never an overwrite.
+are unique across every form, so posting one already on file is a 409, never an overwrite.
+Deleting a submission is a hard delete, so its id is free again afterwards.
 
 The submitter is not client-chosen. Both `POST /api/v1/forms/{id}/submissions` and
 `POST /api/v1/sync/push` overwrite `collector_id` with the account the token names, so a
@@ -410,9 +418,7 @@ curl -X POST http://localhost:3000/api/v1/forms \
 |---------|-------------|
 | [TerraVista](https://github.com/GeoLang/terravista) | Map engine core for a future field app |
 | [Ptolemy](https://github.com/GeoLang/ptolemy) | Geodatabase backend for collected features |
-| [GeoGit](https://github.com/GeoLang/geogit) | Version control for collected datasets |
 | [ViewTopia](https://github.com/GeoLang/viewtopia) | Field Data panel lists forms and loads submissions as a map layer |
-| [GeoKode](https://github.com/GeoLang/geokode) | Reverse geocode submission locations |
 
 ---
 

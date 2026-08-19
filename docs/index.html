@@ -45,9 +45,9 @@ footer{padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
 <div class="container">
 <h2>Features</h2>
 <div class="grid">
-<div class="card"><h3>📝 Form Schemas</h3><p>20+ field types with conditional logic, validation constraints, and XLSForm-compatible structure.</p></div>
+<div class="card"><h3>📝 Form Schemas</h3><p>20+ field types with validation constraints and XLSForm-compatible structure. Conditional logic rides through the XLSForm path as metadata and is evaluated on the device by ODK Collect.</p></div>
 <div class="card"><h3>📡 Sync Protocol</h3><p>Idempotent submission push and cursor-based form pull. A <code>SyncQueue</code> library type with exponential backoff retry is provided for a client to drive.</p></div>
-<div class="card"><h3>📎 Attachments</h3><p>Photo, audio, video, signature, and barcode parts arrive as multipart parts on the OpenRosa submission endpoint, are stored on disk, and download from <code>/api/v1/attachments/{id}</code>.</p></div>
+<div class="card"><h3>📎 Attachments</h3><p>Photo, audio, video, file, and signature parts arrive as multipart parts on the OpenRosa submission endpoint, are stored on disk, and download from <code>/api/v1/attachments/{id}</code>.</p></div>
 <div class="card"><h3>📱 OpenRosa</h3><p>formList, form.xml, and multipart submission endpoints with a Basic auth challenge, so ODK Collect works as the field client today.</p></div>
 <div class="card"><h3>🌍 GPS Field Types</h3><p>Point, trace, and shape geometry types in the form model, with latitude, longitude, altitude, and accuracy. Capture happens in the client.</p></div>
 <div class="card"><h3>✅ Validation</h3><p>Required fields, numeric range checks, text length, glob-style patterns, and OneOf sets. All errors are reported, not just the first.</p></div>
@@ -62,7 +62,9 @@ footer{padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
 <p>Collecta aims to be an open-source alternative to ArcGIS Field Maps, KoboToolbox, and ODK Collect. Today it is the server and the shared schema library, not the field app.</p>
 <table>
 <tr><th>Capability</th><th>Status</th></tr>
-<tr><td>Form schemas, validation, conditional logic, repeat groups</td><td>Working</td></tr>
+<tr><td>Form schemas and validation</td><td>Working, top-level fields only</td></tr>
+<tr><td>Repeat groups</td><td>Working through the model, renderer and parser, not validated</td></tr>
+<tr><td>Conditional logic</td><td>Carried as XLSForm metadata and evaluated by ODK Collect, not server-side</td></tr>
 <tr><td>REST API with SQLite persistence</td><td>Working</td></tr>
 <tr><td>JWT auth, argon2id hashing, admin-seeded users</td><td>Working</td></tr>
 <tr><td>Sync push and cursor-based form pull</td><td>Working</td></tr>
