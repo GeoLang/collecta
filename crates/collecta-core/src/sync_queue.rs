@@ -3,7 +3,7 @@
 //! Submissions are stored locally and synced to the server when connectivity
 //! is available. Failed syncs are retried with exponential backoff.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -11,6 +11,9 @@ use crate::submission::Submission;
 use crate::sync_protocol::{PushItemStatus, PushRequest, PushResponse};
 
 /// Offline sync queue — stores submissions pending upload.
+///
+/// The whole queue serializes, so a client can keep it in a file between runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncQueue {
     items: Vec<QueueItem>,
     max_retries: u32,
@@ -112,6 +115,30 @@ impl SyncQueue {
         }
     }
 
+    /// Every item in the queue, in the order they were enqueued.
+    pub fn items(&self) -> &[QueueItem] {
+        &self.items
+    }
+
+    /// Items due for a push attempt at `now`: everything pending, minus the
+    /// failed items still inside their backoff window.
+    pub fn due(&self, now: DateTime<Utc>) -> Vec<&QueueItem> {
+        self.pending()
+            .into_iter()
+            .filter(|item| self.next_attempt_at(item).is_none_or(|due| due <= now))
+            .collect()
+    }
+
+    /// When `item` may next be attempted, or `None` when it may be attempted
+    /// now because nothing has been tried yet.
+    pub fn next_attempt_at(&self, item: &QueueItem) -> Option<DateTime<Utc>> {
+        let last_attempt = item.last_attempt?;
+        // the first retry waits the 5s base, and by then one attempt has
+        // already been counted.
+        let wait = Self::backoff_seconds(item.retry_count.saturating_sub(1));
+        Some(last_attempt + Duration::seconds(wait as i64))
+    }
+
     /// Get total number of items in queue.
     pub fn len(&self) -> usize {
         self.items.len()
@@ -127,11 +154,11 @@ impl SyncQueue {
         self.items.iter().filter(|i| i.status == status).count()
     }
 
-    /// Build a push batch from every item currently pending sync.
-    pub fn build_push_request(&self) -> PushRequest {
+    /// Build a push batch from every item due for an attempt at `now`.
+    pub fn build_push_request(&self, now: DateTime<Utc>) -> PushRequest {
         PushRequest {
             submissions: self
-                .pending()
+                .due(now)
                 .iter()
                 .map(|item| item.submission.clone())
                 .collect(),
@@ -238,7 +265,7 @@ mod tests {
         queue.enqueue(dup);
         queue.enqueue(bad);
 
-        let request = queue.build_push_request();
+        let request = queue.build_push_request(Utc::now());
         assert_eq!(request.submissions.len(), 3);
 
         let response = PushResponse {
@@ -264,9 +291,59 @@ mod tests {
 
         assert_eq!(queue.count_by_status(SyncStatus::Synced), 2);
         assert_eq!(queue.count_by_status(SyncStatus::Failed), 1);
-        // only the failed item is retried on the next push.
-        assert_eq!(queue.build_push_request().submissions.len(), 1);
-        assert_eq!(queue.build_push_request().submissions[0].id, bad_id);
+        // only the failed item is retried, and only once its backoff has passed.
+        let after_backoff = Utc::now() + Duration::seconds(5);
+        assert!(queue.build_push_request(Utc::now()).submissions.is_empty());
+        assert_eq!(queue.build_push_request(after_backoff).submissions.len(), 1);
+        assert_eq!(
+            queue.build_push_request(after_backoff).submissions[0].id,
+            bad_id
+        );
+    }
+
+    #[test]
+    fn test_backoff_gates_retry() {
+        let mut queue = SyncQueue::new();
+        let submission = Submission::new(Uuid::new_v4(), 1);
+        let submission_id = submission.id;
+        queue.enqueue(submission);
+        assert_eq!(queue.due(Utc::now()).len(), 1);
+
+        queue.mark_failed(submission_id, "connection refused".to_string());
+        let attempted_at = queue.items()[0].last_attempt.unwrap();
+        assert!(queue.due(attempted_at + Duration::seconds(4)).is_empty());
+        assert_eq!(queue.due(attempted_at + Duration::seconds(5)).len(), 1);
+
+        queue.mark_failed(submission_id, "connection refused".to_string());
+        let attempted_at = queue.items()[0].last_attempt.unwrap();
+        assert!(queue.due(attempted_at + Duration::seconds(9)).is_empty());
+        assert_eq!(queue.due(attempted_at + Duration::seconds(10)).len(), 1);
+    }
+
+    #[test]
+    fn test_queue_round_trips_through_json() {
+        let mut queue = SyncQueue::with_max_retries(3);
+        let submission = Submission::new(Uuid::new_v4(), 1);
+        let submission_id = submission.id;
+        queue.enqueue(submission);
+        queue.enqueue(Submission::new(Uuid::new_v4(), 2));
+        queue.mark_failed(submission_id, "connection refused".to_string());
+
+        let json = serde_json::to_string(&queue).unwrap();
+        let mut restored: SyncQueue = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored.items()[0].submission.id, submission_id);
+        assert_eq!(restored.items()[0].status, SyncStatus::Failed);
+        assert_eq!(restored.items()[0].retry_count, 1);
+        assert_eq!(
+            restored.items()[0].last_error.as_deref(),
+            Some("connection refused")
+        );
+        // max_retries survives, so a restored queue abandons at the same point.
+        restored.mark_failed(submission_id, "connection refused".to_string());
+        restored.mark_failed(submission_id, "connection refused".to_string());
+        assert_eq!(restored.count_by_status(SyncStatus::Abandoned), 1);
     }
 
     #[test]

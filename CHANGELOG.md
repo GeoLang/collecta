@@ -14,6 +14,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no integration exists yet, which is the case.
 
 ### Added
+- `collecta-cli` (2026-08-23), the first consumer of the `SyncQueue`: `submit`
+  enqueues a submission file, `push` drains the queue to
+  `POST /api/v1/sync/push` and records the per-item results, `status` lists what
+  is queued and when each failed item is due again. The queue is a JSON file
+  (`./collecta-queue.json`, `$COLLECTA_QUEUE` or `--queue`) written through a
+  temporary file, so a submission taken offline survives the run that took it
+  and every run after until the server accepts it. `submit` never touches the
+  network.
+- `SyncQueue` serializes as a whole, which is what lets a client keep it on
+  disk, and `build_push_request` now takes the current time and leaves out
+  failed items still inside their backoff. Before, the batch it built ignored
+  backoff entirely, so a client draining the queue in a loop would have retried
+  a rejected submission as fast as it could send it.
 - Platform deployment (2026-08-14): a Dockerfile on the fenestra pattern
   (non-root, /data volume for the sqlite database and attachment blobs,
   /health healthcheck), wired into viewtopia's platform compose behind an

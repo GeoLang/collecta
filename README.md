@@ -23,22 +23,25 @@ It provides:
 - **JWT auth** with argon2id password hashing, admin-seeded users, and three roles
 - **Sync protocol**: idempotent submission push and cursor-based form pull
 - **XLSForm import** (`.xlsx` survey/choices/settings) into the form model
-- **Offline sync queue** as a library type in `collecta-core`, for a client to build on
+- **Offline sync queue** in `collecta-core`, driven by the `collecta-cli` command line
+  client and available to any other client
 
 ### Status
 
 **Working:** the Axum server, SQLite persistence, JWT auth with role, form-ownership and
 per-form grant checks, form CRUD including deletes, submission validation and ingestion,
-attachment download, XLSForm import, the push/pull sync endpoints, and an OpenRosa
-compatibility layer that ODK Collect can submit to. All are covered by tests
-(`cargo test` runs 117).
+attachment download, XLSForm import, the push/pull sync endpoints, an OpenRosa
+compatibility layer that ODK Collect can submit to, and the `collecta-cli` offline queue
+and push client. All are covered by tests (`cargo test` runs 124).
 
 **Not built yet:**
 
-- **No first-party client application.** There is no mobile app, desktop app, or FFI
-  layer of our own; ODK Collect is the supported client. The `SyncQueue` and
-  `AttachmentStore` types in `collecta-core` are there for a client author to use, and
-  nothing in this repo uses them.
+- **No mobile or desktop app.** `collecta-cli` queues and pushes submissions from a
+  terminal, and ODK Collect is the supported app for filling forms in; there is no app
+  or FFI layer of our own. The `AttachmentStore` type in `collecta-core` is there for a
+  client author to use, and nothing in this repo uses it.
+- **No form pull in the client.** `collecta-cli` only pushes. Fetching form definitions
+  over `GET /api/v1/sync/forms` is still unimplemented on the client side.
 - **No attachment sync.** Attachments can be uploaded over OpenRosa and downloaded over
   the JSON API, but they are not part of the push/pull protocol.
 - **No Ptolemy integration.** Writing collected features through to the geodatabase is
@@ -57,6 +60,9 @@ compatibility layer that ODK Collect can submit to. All are covered by tests
 │  │  Engine  │  │  & Sync  │  │    audio, signatures) │ │
 │  └──────────┘  └──────────┘  └──────────────────────┘ │
 ├────────────────────────────────────────────────────────┤
+│  collecta-cli (command line client)                    │
+│  Queue file on disk · Push to the sync endpoint        │
+├────────────────────────────────────────────────────────┤
 │  collecta-core (Rust library)                          │
 │  ┌────────┐ ┌────────────┐ ┌──────────┐ ┌──────────┐ │
 │  │ Form   │ │ Submission │ │Validation│ │  Sync    │ │
@@ -70,8 +76,8 @@ compatibility layer that ODK Collect can submit to. All are covered by tests
 └────────────────────────────────────────────────────────┘
 ```
 
-The top and bottom layers are the target design. Only the two middle layers,
-`collecta-core` and `collecta-server`, exist in this repo.
+The top and bottom layers are the target design. The three middle layers,
+`collecta-cli`, `collecta-core` and `collecta-server`, exist in this repo.
 
 ---
 
@@ -91,10 +97,12 @@ The top and bottom layers are the target design. Only the two middle layers,
 
 ### Offline Sync Queue
 
-A `collecta-core` library type for a client to drive. No client in this repo uses it.
+A `collecta-core` type, driven by `collecta-cli` and serializable so a client can keep it
+in a file between runs.
 
 - **Queue submissions locally** so collection does not need connectivity
-- **Exponential backoff retry**: 5s → 10s → 20s → 40s → ... capped at 5min
+- **Exponential backoff retry**: 5s → 10s → 20s → 40s → ... capped at 5min. A failed
+  item is left out of the push batch until its wait has passed.
 - **Max retries** with permanent failure status after threshold
 - **Status tracking**: Pending, Synced, Failed, Abandoned
 - Submissions only. Attachment sync is not implemented on either side.
@@ -307,6 +315,35 @@ client that has been away longer than it takes to delete a form still gets the t
 since nothing prunes them. Submission deletes do not sync: submissions only travel client
 to server, so there is no pull that could hand one back. Attachments are not part of the
 protocol.
+
+---
+
+## Command line client
+
+`collecta-cli` keeps a queue of submissions in a JSON file and pushes it to a server. Only
+`push` uses the network, so a submission can be taken with nothing reachable and sits in
+the queue until a server accepts it.
+
+```bash
+# queue a submission (a JSON Submission, the same shape the push endpoint takes)
+cargo run -p collecta-cli -- submit inspection.json
+
+# what is queued, and when each failed item is due again
+cargo run -p collecta-cli -- status
+
+# drain the queue
+cargo run -p collecta-cli -- push --server http://localhost:3000 --token "$TOKEN"
+```
+
+The queue file is `./collecta-queue.json`, overridable with `$COLLECTA_QUEUE` or
+`--queue <path>`. The bearer token comes from `--token` or `$COLLECTA_TOKEN`; the push
+endpoint requires one and files every item under that account.
+
+A push sends the items that are due and applies the per-item result: `accepted` and
+`duplicate` mark an item synced, `error` marks it failed and shows the server's message.
+A request that never lands fails every item in the batch, so a server that is down costs
+one retry rather than the queue. Failed items wait out their backoff before going out
+again, and `push` exits non-zero when the request itself failed.
 
 ---
 
