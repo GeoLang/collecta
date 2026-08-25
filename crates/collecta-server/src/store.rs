@@ -105,6 +105,14 @@ impl FormWriter {
     }
 }
 
+/// Where a form's submissions are published: the ptolemy dataset created for it
+/// and the branch its features are committed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishTarget {
+    pub dataset_id: Uuid,
+    pub branch_id: Uuid,
+}
+
 /// A stored user. Internal to the server: carries the password hash and is
 /// never serialized into responses.
 #[derive(Debug, Clone)]
@@ -182,12 +190,20 @@ impl Store {
                 granted_at TEXT NOT NULL,
                 PRIMARY KEY (form_id, user_id)
             )",
+            "CREATE TABLE IF NOT EXISTS published_submissions (
+                submission_id TEXT PRIMARY KEY,
+                form_id TEXT NOT NULL,
+                published_at TEXT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS published_submissions_form
+                ON published_submissions (form_id)",
         ] {
             sqlx::query(ddl).execute(&self.pool).await?;
         }
         self.migrate_forms_updated_at().await?;
         self.migrate_forms_creator_id().await?;
         self.migrate_forms_deleted_at().await?;
+        self.migrate_forms_publish_target().await?;
         self.migrate_submissions_instance_id().await
     }
 
@@ -230,6 +246,15 @@ impl Store {
     // form with no way to learn it is gone.
     async fn migrate_forms_deleted_at(&self) -> Result<(), sqlx::Error> {
         self.add_column("ALTER TABLE forms ADD COLUMN deleted_at TEXT")
+            .await
+    }
+
+    // the ptolemy dataset and branch a form publishes into, written on its first
+    // publish. Both are null until then.
+    async fn migrate_forms_publish_target(&self) -> Result<(), sqlx::Error> {
+        self.add_column("ALTER TABLE forms ADD COLUMN ptolemy_dataset_id TEXT")
+            .await?;
+        self.add_column("ALTER TABLE forms ADD COLUMN ptolemy_branch_id TEXT")
             .await
     }
 
@@ -386,6 +411,7 @@ impl Store {
                 (SELECT id FROM submissions WHERE form_id = ?)",
             "DELETE FROM submissions WHERE form_id = ?",
             "DELETE FROM form_grants WHERE form_id = ?",
+            "DELETE FROM published_submissions WHERE form_id = ?",
         ] {
             sqlx::query(statement)
                 .bind(&form_id)
@@ -430,6 +456,7 @@ impl Store {
         for statement in [
             "DELETE FROM attachments WHERE submission_id = ?",
             "DELETE FROM sync_queue WHERE submission_id = ?",
+            "DELETE FROM published_submissions WHERE submission_id = ?",
         ] {
             sqlx::query(statement)
                 .bind(&submission_id)
@@ -753,6 +780,94 @@ impl Store {
             .fetch_all(&self.pool)
             .await?;
         Ok(rows.iter().map(row_json).collect())
+    }
+
+    /// Where this form publishes, or `None` when it has never been published.
+    pub async fn publish_target(
+        &self,
+        form_id: Uuid,
+    ) -> Result<Option<PublishTarget>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT ptolemy_dataset_id, ptolemy_branch_id FROM forms
+             WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(form_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let dataset: Option<String> = row.get("ptolemy_dataset_id");
+        let branch: Option<String> = row.get("ptolemy_branch_id");
+        Ok(dataset
+            .and_then(|id| id.parse().ok())
+            .zip(branch.and_then(|id| id.parse().ok()))
+            .map(|(dataset_id, branch_id)| PublishTarget {
+                dataset_id,
+                branch_id,
+            }))
+    }
+
+    pub async fn set_publish_target(
+        &self,
+        form_id: Uuid,
+        target: PublishTarget,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE forms SET ptolemy_dataset_id = ?, ptolemy_branch_id = ? WHERE id = ?")
+            .bind(target.dataset_id.to_string())
+            .bind(target.branch_id.to_string())
+            .bind(form_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The form's submissions no publish has recorded yet, oldest first.
+    pub async fn unpublished_submissions(
+        &self,
+        form_id: Uuid,
+    ) -> Result<Vec<Submission>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT s.data FROM submissions s
+             LEFT JOIN published_submissions p ON p.submission_id = s.id
+             WHERE s.form_id = ? AND p.submission_id IS NULL
+             ORDER BY s.rowid",
+        )
+        .bind(form_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_json).collect())
+    }
+
+    /// Mark submissions published. Recording one twice is a no-op, so a rerun
+    /// after a batch that never landed cannot double-count what did.
+    pub async fn record_published(
+        &self,
+        form_id: Uuid,
+        submission_ids: &[Uuid],
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        for submission_id in submission_ids {
+            sqlx::query(
+                "INSERT OR IGNORE INTO published_submissions
+                 (submission_id, form_id, published_at) VALUES (?, ?, ?)",
+            )
+            .bind(submission_id.to_string())
+            .bind(form_id.to_string())
+            .bind(timestamp_now())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await
+    }
+
+    /// How many of the form's submissions have ever been published.
+    pub async fn published_count(&self, form_id: Uuid) -> Result<usize, sqlx::Error> {
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM published_submissions WHERE form_id = ?")
+            .bind(form_id.to_string())
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<i64, _>("n") as usize)
     }
 
     pub async fn sync_counts(&self) -> Result<SyncCounts, sqlx::Error> {

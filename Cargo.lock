@@ -341,6 +341,7 @@ dependencies = [
  "jsonwebtoken",
  "md-5",
  "quick-xml",
+ "reqwest",
  "rust_xlsxwriter",
  "serde",
  "serde_json",

@@ -31,8 +31,9 @@ It provides:
 **Working:** the Axum server, SQLite persistence, JWT auth with role, form-ownership and
 per-form grant checks, form CRUD including deletes, submission validation and ingestion,
 attachment download, XLSForm import, the push/pull sync endpoints, an OpenRosa
-compatibility layer that ODK Collect can submit to, and the `collecta-cli` offline queue
-and push client. All are covered by tests (`cargo test` runs 124).
+compatibility layer that ODK Collect can submit to, publishing a form's submissions into
+a Ptolemy dataset, and the `collecta-cli` offline queue and push client. All are covered
+by tests (`cargo test` runs 133).
 
 **Not built yet:**
 
@@ -44,8 +45,10 @@ and push client. All are covered by tests (`cargo test` runs 124).
   over `GET /api/v1/sync/forms` is still unimplemented on the client side.
 - **No attachment sync.** Attachments can be uploaded over OpenRosa and downloaded over
   the JSON API, but they are not part of the push/pull protocol.
-- **No Ptolemy integration.** Writing collected features through to the geodatabase is
-  planned, not wired up.
+- **No automatic publishing.** `POST /api/v1/forms/{id}/publish` writes collected
+  features into Ptolemy on demand, and nothing calls it for you: a submission does not
+  reach the geodatabase until someone publishes. Attachment bytes stay here, and the
+  published feature carries their download URLs.
 
 ---
 
@@ -72,12 +75,15 @@ and push client. All are covered by tests (`cargo test` runs 124).
 │  collecta-server (Axum REST API)                       │
 │  Form CRUD · Submission ingestion · Sync endpoints     │
 ├────────────────────────────────────────────────────────┤
-│  ptolemy (geodatabase) — spatial storage    [PLANNED]  │
+│  ptolemy (geodatabase) — spatial storage               │
+│  One dataset per form · Submissions committed as       │
+│  versioned features by POST /forms/{id}/publish        │
 └────────────────────────────────────────────────────────┘
 ```
 
-The top and bottom layers are the target design. The three middle layers,
-`collecta-cli`, `collecta-core` and `collecta-server`, exist in this repo.
+The top layer is the target design. The three middle layers, `collecta-cli`,
+`collecta-core` and `collecta-server`, exist in this repo, and the bottom one is
+Ptolemy, which publishing writes to over its REST API.
 
 ---
 
@@ -139,6 +145,7 @@ and the XForm renderer emits empty instance nodes, so it never reaches Collect.
 | GET | `/api/v1/forms/{id}/grants` | List the accounts this form is shared with | form creator, admin |
 | POST | `/api/v1/forms/{id}/grants` | Share the form's data (`{"user_id": "<uuid>"}`) | form creator, admin |
 | DELETE | `/api/v1/forms/{id}/grants/{user_id}` | Withdraw a grant | form creator, admin |
+| POST | `/api/v1/forms/{id}/publish` | Publish new submissions into Ptolemy | form creator, admin |
 | GET | `/api/v1/attachments/{id}` | Download an attachment's bytes | creator, grantee, admin |
 | GET | `/api/v1/sync/status` | Count of submissions received (whole instance) | admin |
 | POST | `/api/v1/sync/push` | Batch-upload queued submissions (idempotent) | editor, admin |
@@ -174,6 +181,50 @@ Deleting a form leaves a tombstone the form pull hands to clients. Its submissio
 attachments (rows and files) and the grants on it are removed outright. Deleting a
 submission is a hard delete, since submissions only ever travel client to server. Writing
 a form under a deleted id clears the tombstone and brings the id back.
+
+---
+
+## Publishing to Ptolemy
+
+`POST /api/v1/forms/{id}/publish` (empty body) writes the form's submissions into one
+[Ptolemy](https://github.com/GeoLang/ptolemy) dataset as versioned features. It is on
+demand: nothing publishes on its own, so submissions reach the geodatabase when someone
+asks. Set `COLLECTA_PTOLEMY_URL` to the root Ptolemy is served at, otherwise the route
+answers 503.
+
+```json
+{"dataset_id": "...", "branch_id": "...", "published": 12, "skipped": 1, "total_published": 47}
+```
+
+`published` and `skipped` count this call, `total_published` counts every submission of
+the form published so far.
+
+The caller's own bearer token is forwarded to Ptolemy, so collecta stores no credential
+there and can publish only what the caller could have written by hand. Both services take
+platform JWTs of the same shape, so one token works on both. A token Ptolemy refuses comes
+back as 403, and a Ptolemy that is unreachable or failing comes back as 502 naming its
+status.
+
+The first publish of a form creates the dataset (named after the form title, srid 4326),
+sets its attribute schema, creates its `main` branch, and records the dataset and branch
+ids on the form. The dataset's geometry type comes from the form's first `geopoint`,
+`geotrace` or `geoshape` field (point, linestring, polygon). A form with no geometry field
+publishes each submission's `device_location` as a point. Every publish after that reuses
+the recorded ids.
+
+Each feature is one submission:
+
+- its feature id **is** the submission id, so a feature is traceable back to the row here
+- its geometry is the first geometry field's value, falling back to `device_location`. A
+  submission with neither is skipped and counted in `skipped`
+- its properties are the other field values keyed by field name, plus `submission_id`,
+  `collector_id` and `completed_at`. Attachments become absolute download URLs built from
+  `COLLECTA_BASE_URL`, so the bytes stay here and the feature points at them
+
+Features are committed in batches of 500, and each batch is recorded as published the
+moment Ptolemy accepts it. A publish that dies half way therefore leaves the accepted
+batches recorded, and the next one sends only the rest. A submission already published is
+never sent again.
 
 ---
 
@@ -350,7 +401,8 @@ again, and `push` exits non-zero when the request itself failed.
 ## Persistence
 
 Server state is stored in SQLite (`forms`, `submissions`, `sync_queue`, `users`,
-`attachments`, `form_grants` tables), so forms and submissions survive restarts.
+`attachments`, `form_grants`, `published_submissions` tables), so forms and submissions
+survive restarts.
 Attachment bytes live on disk under the data directory, and the table holds their
 metadata and paths. A deleted form keeps its `forms` row with `deleted_at` set, both the
 tombstone and what hides it from every read path.
@@ -366,7 +418,10 @@ Environment variables:
 - `COLLECTA_BASE_URL` — absolute origin advertised in OpenRosa `downloadUrl`s
   (e.g. `https://collect.example.org`). Unset, it is derived from each request's
   `Host`, which is fine directly on the internet but wrong behind a proxy that
-  rewrites it.
+  rewrites it. Also the origin of the attachment URLs a published feature carries,
+  where it is the only source: unset, those URLs are the route alone
+- `COLLECTA_PTOLEMY_URL` — root Ptolemy is served at (e.g. `http://ptolemy:8000`).
+  Unset, `POST /api/v1/forms/{id}/publish` answers 503
 
 ---
 
@@ -454,7 +509,7 @@ curl -X POST http://localhost:3000/api/v1/forms \
 | Project | Integration |
 |---------|-------------|
 | [TerraVista](https://github.com/GeoLang/terravista) | Map engine core for a future field app |
-| [Ptolemy](https://github.com/GeoLang/ptolemy) | Geodatabase backend for collected features |
+| [Ptolemy](https://github.com/GeoLang/ptolemy) | `POST /api/v1/forms/{id}/publish` commits a form's submissions there as versioned features |
 | [ViewTopia](https://github.com/GeoLang/viewtopia) | Field Data panel lists forms and loads submissions as a map layer |
 
 ---

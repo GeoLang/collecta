@@ -17,12 +17,16 @@
 //! `collector_id`, taken from the caller's credentials on both surfaces. A row
 //! without one predates the recording; nothing stored since can lack it.
 //!
+//! [`publish`] writes a form's collected data on to ptolemy, forwarding the
+//! caller's own token rather than holding a credential of its own.
+//!
 //! [`openrosa`] adds a second, Basic-authenticated surface at the server root
 //! for ODK Collect. The two share the users table and nothing else.
 
 pub mod attachment;
 pub mod auth;
 pub mod openrosa;
+pub mod publish;
 pub mod store;
 
 use std::path::{Path as FsPath, PathBuf};
@@ -58,6 +62,8 @@ pub struct Config {
     /// Absolute origin to advertise in OpenRosa `downloadUrl`s. When unset the
     /// URL is derived from each request.
     pub base_url: Option<String>,
+    /// Root ptolemy is served at. Unset, publishing answers 503.
+    pub ptolemy_url: Option<String>,
 }
 
 impl Config {
@@ -68,6 +74,7 @@ impl Config {
             jwt_secret: jwt_secret.into(),
             data_dir: data_dir.into(),
             base_url: None,
+            ptolemy_url: None,
         }
     }
 }
@@ -79,6 +86,7 @@ pub struct AppState {
     pub jwt_secret: Arc<str>,
     pub data_dir: Arc<FsPath>,
     pub base_url: Option<Arc<str>>,
+    pub ptolemy_url: Option<Arc<str>>,
 }
 
 /// Build the router over an already-open [`Store`].
@@ -95,6 +103,7 @@ pub fn router(store: Store, config: Config) -> Router {
         jwt_secret: Arc::from(config.jwt_secret.as_str()),
         data_dir: Arc::from(config.data_dir.as_path()),
         base_url: config.base_url.as_deref().map(Arc::from),
+        ptolemy_url: config.ptolemy_url.as_deref().map(Arc::from),
     };
     // form discovery, open to any authenticated account, plus the routes whose
     // handlers narrow to the form's creator, its grantees, and admins.
@@ -128,6 +137,9 @@ pub fn router(store: Store, config: Config) -> Router {
     let protected = read
         .merge(write)
         .merge(admin)
+        // publishing narrows to the form's creator and admins in its handler,
+        // like the other routes that name one form
+        .route("/api/v1/forms/{form_id}/publish", post(publish::publish))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
@@ -160,6 +172,7 @@ pub fn config_from_env() -> Config {
             .unwrap_or_else(|_| "./collecta-data".to_string())
             .into(),
         base_url: std::env::var("COLLECTA_BASE_URL").ok(),
+        ptolemy_url: std::env::var(publish::PTOLEMY_URL_VARIABLE).ok(),
     }
 }
 

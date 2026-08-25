@@ -26,6 +26,9 @@ use crate::store::UserRecord;
 
 pub const TOKEN_TTL_HOURS: i64 = 24;
 
+/// Scheme prefix of the `Authorization` header the JSON API takes.
+pub const BEARER_PREFIX: &str = "Bearer ";
+
 /// JWT claims (same shape as tiletopia's).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
@@ -131,7 +134,7 @@ fn extract_claims(request: &Request, secret: &str) -> Result<Claims, StatusCode>
         .and_then(|v| v.to_str().ok())
         .ok_or(StatusCode::UNAUTHORIZED)?;
     let token = auth_header
-        .strip_prefix("Bearer ")
+        .strip_prefix(BEARER_PREFIX)
         .ok_or(StatusCode::UNAUTHORIZED)?;
     decode::<Claims>(
         token,

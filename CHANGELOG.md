@@ -14,6 +14,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no integration exists yet, which is the case.
 
 ### Added
+- Publishing to ptolemy (2026-08-25): `POST /api/v1/forms/{id}/publish` commits a
+  form's submissions into one ptolemy dataset as versioned features, on demand,
+  to the form's creator or an admin. The first publish creates the dataset, its
+  attribute schema and its `main` branch and records both ids on the form. Every
+  publish after that sends only the submissions no earlier one recorded, in
+  batches of 500, marking each batch published the moment ptolemy accepts it, so
+  a run that dies half way costs the rest of the batch rather than duplicating
+  what already landed. A feature's id is its submission id, its geometry is the
+  form's first geometry field falling back to `device_location` (a submission
+  with neither is skipped and counted), and its properties are the other field
+  values plus `submission_id`, `collector_id`, `completed_at` and attachment
+  download URLs. The caller's own bearer token is forwarded, so collecta holds no
+  ptolemy credential: a token ptolemy refuses is a 403, an unreachable or failing
+  ptolemy is a 502 naming its status, and an unset `COLLECTA_PTOLEMY_URL` is a
+  503. The store gained `published_submissions` plus `ptolemy_dataset_id` and
+  `ptolemy_branch_id` on `forms`.
 - `collecta-cli` (2026-08-23), the first consumer of the `SyncQueue`: `submit`
   enqueues a submission file, `push` drains the queue to
   `POST /api/v1/sync/push` and records the per-item results, `status` lists what
