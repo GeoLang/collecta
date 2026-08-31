@@ -1,7 +1,7 @@
-//! Attachment handling — photos, audio, signatures, files.
+//! Attachment handling: photos, audio, signatures, files.
 //!
-//! Manages binary attachments associated with form submissions.
-//! Attachments are stored locally and synced separately from submission data.
+//! Types for binary attachments on form submissions, for a client author to
+//! use. Nothing in this repo stores or syncs attachments.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
