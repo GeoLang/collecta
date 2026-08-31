@@ -14,6 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no integration exists yet, which is the case.
 
 ### Added
+- `collecta-cli pull` (2026-08-31): fetches form definitions from
+  `GET /api/v1/sync/forms` into a second JSON file (`./collecta-forms.json`,
+  `$COLLECTA_FORMS` or `--forms <path>`), so a device can pick up a form it was
+  not shipped with. Each run sends the stored cursor as `since`, replaces the
+  definitions the response carries, drops the ones it tombstones and stores the
+  new cursor. A pull that the server refuses or that never lands exits non-zero
+  and leaves the file alone. `PulledForms` in `collecta-core` holds the forms and
+  the cursor and applies a response, the pull side of what
+  `SyncQueue::apply_push_response` does for push.
 - Publishing to ptolemy (2026-08-25): `POST /api/v1/forms/{id}/publish` commits a
   form's submissions into one ptolemy dataset as versioned features, on demand,
   to the form's creator or an admin. The first publish creates the dataset, its

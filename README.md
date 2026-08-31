@@ -32,8 +32,8 @@ It provides:
 per-form grant checks, form CRUD including deletes, submission validation and ingestion,
 attachment download, XLSForm import, the push/pull sync endpoints, an OpenRosa
 compatibility layer that ODK Collect can submit to, publishing a form's submissions into
-a Ptolemy dataset, and the `collecta-cli` offline queue and push client. All are covered
-by tests (`cargo test` runs 133).
+a Ptolemy dataset, and the `collecta-cli` client that queues and pushes submissions and
+pulls form definitions. All are covered by tests (`cargo test` runs 142).
 
 **Not built yet:**
 
@@ -41,8 +41,8 @@ by tests (`cargo test` runs 133).
   terminal, and ODK Collect is the supported app for filling forms in; there is no app
   or FFI layer of our own. The `AttachmentStore` type in `collecta-core` is there for a
   client author to use, and nothing in this repo uses it.
-- **No form pull in the client.** `collecta-cli` only pushes. Fetching form definitions
-  over `GET /api/v1/sync/forms` is still unimplemented on the client side.
+- **Nothing renders a pulled form.** `collecta-cli pull` stores form definitions on the
+  device, and filling one in still means writing the submission JSON by hand.
 - **No attachment sync.** Attachments can be uploaded over OpenRosa and downloaded over
   the JSON API, but they are not part of the push/pull protocol.
 - **No automatic publishing.** `POST /api/v1/forms/{id}/publish` writes collected
@@ -64,7 +64,7 @@ by tests (`cargo test` runs 133).
 │  └──────────┘  └──────────┘  └──────────────────────┘ │
 ├────────────────────────────────────────────────────────┤
 │  collecta-cli (command line client)                    │
-│  Queue file on disk · Push to the sync endpoint        │
+│  Queue file on disk · Push submissions · Pull forms    │
 ├────────────────────────────────────────────────────────┤
 │  collecta-core (Rust library)                          │
 │  ┌────────┐ ┌────────────┐ ┌──────────┐ ┌──────────┐ │
@@ -358,7 +358,9 @@ directions:
 - `GET /api/v1/sync/forms?since=<cursor>` returns form definitions changed after
   the cursor, the ids of the forms deleted since it (`deleted`), and the next cursor.
   Omit `since` for a full refresh. The cursor is opaque (currently
-  `<rfc3339>@<rowid>`), so store it and echo it back url-encoded.
+  `<rfc3339>@<rowid>`), so store it and echo it back url-encoded. `PulledForms` holds
+  the forms and the cursor on the client and applies a response, and `collecta-cli pull`
+  keeps it in a file.
 
 A deleted form keeps its row as the tombstone, so deletes ride the same cursor as edits
 and a client pulling in order cannot receive a form after the delete that removed it. A
@@ -372,8 +374,8 @@ protocol.
 ## Command line client
 
 `collecta-cli` keeps a queue of submissions in a JSON file and pushes it to a server. Only
-`push` uses the network, so a submission can be taken with nothing reachable and sits in
-the queue until a server accepts it.
+`push` and `pull` use the network, so a submission can be taken with nothing reachable and
+sits in the queue until a server accepts it.
 
 ```bash
 # queue a submission (a JSON Submission, the same shape the push endpoint takes)
@@ -384,6 +386,9 @@ cargo run -p collecta-cli -- status
 
 # drain the queue
 cargo run -p collecta-cli -- push --server http://localhost:3000 --token "$TOKEN"
+
+# fetch the form definitions changed since the last pull
+cargo run -p collecta-cli -- pull --server http://localhost:3000 --token "$TOKEN"
 ```
 
 The queue file is `./collecta-queue.json`, overridable with `$COLLECTA_QUEUE` or
@@ -395,6 +400,12 @@ A push sends the items that are due and applies the per-item result: `accepted` 
 A request that never lands fails every item in the batch, so a server that is down costs
 one retry rather than the queue. Failed items wait out their backoff before going out
 again, and `push` exits non-zero when the request itself failed.
+
+A pull stores the forms and the cursor in `./collecta-forms.json`, overridable with
+`$COLLECTA_FORMS` or `--forms <path>`. It sends the stored cursor as `since`, so the first
+run takes every form and each later one takes what changed, including the deletes: a
+tombstoned form is dropped from the file. A pull the server refuses exits non-zero and
+leaves the file as it was.
 
 ---
 

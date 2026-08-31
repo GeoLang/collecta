@@ -69,7 +69,7 @@ footer{padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
 <tr><td>JWT auth, argon2id hashing, admin-seeded users</td><td>Working</td></tr>
 <tr><td>Sync push and cursor-based form pull</td><td>Working</td></tr>
 <tr><td>XLSForm import</td><td>Working, expressions carried as metadata but not evaluated</td></tr>
-<tr><td>Command line client</td><td>Working, <code>collecta-cli</code> queues submissions offline and pushes them, no form pull yet</td></tr>
+<tr><td>Command line client</td><td>Working, <code>collecta-cli</code> queues submissions offline, pushes them and pulls form definitions</td></tr>
 <tr><td>Mobile or desktop client</td><td>Not built, ODK Collect works against the OpenRosa endpoints</td></tr>
 <tr><td>Media attachment upload and download</td><td>Working, OpenRosa multipart upload to disk, authenticated download endpoint</td></tr>
 <tr><td>Deletes and tombstones in sync</td><td>Working, deleted forms surface as tombstones on the sync cursor</td></tr>
@@ -87,7 +87,7 @@ footer{padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
 <tr><td><code>collecta-core</code></td><td>Form schemas, validation, sync queue and attachment types</td></tr>
 <tr><td><code>collecta-xlsform</code></td><td>XLSForm (.xlsx) importer</td></tr>
 <tr><td><code>collecta-server</code></td><td>Axum REST API for form management and submission ingestion</td></tr>
-<tr><td><code>collecta-cli</code></td><td>Command line client: queue submissions offline, push them when a server is reachable</td></tr>
+<tr><td><code>collecta-cli</code></td><td>Command line client: queue submissions offline, push them when a server is reachable, pull form definitions</td></tr>
 </table>
 </div>
 </section>

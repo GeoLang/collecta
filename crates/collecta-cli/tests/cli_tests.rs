@@ -1,22 +1,25 @@
-//! End-to-end tests for the CLI binary against a stub push endpoint.
+//! End-to-end tests for the CLI binary against stub sync endpoints.
 //!
-//! The stub replaces the server, never the queue: every assertion reads the
-//! queue file the binary actually wrote.
+//! The stub replaces the server, never the files: every assertion reads the
+//! queue or forms file the binary actually wrote.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use axum::response::Json;
-use axum::routing::post;
+use axum::routing::{get, post};
 use chrono::{Duration, Utc};
 use collecta_core::submission::FieldValue;
-use collecta_core::sync_protocol::{PushItemResult, PushItemStatus, PushRequest, PushResponse};
-use collecta_core::{Submission, SyncQueue, SyncStatus};
+use collecta_core::sync_protocol::{
+    FormsPullResponse, PushItemResult, PushItemStatus, PushRequest, PushResponse,
+};
+use collecta_core::{Form, PulledForms, Submission, SyncQueue, SyncStatus};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -139,6 +142,16 @@ fn start_stub_server(rejected: Vec<Uuid>) -> StubServer {
         .route("/api/v1/sync/push", post(stub_push))
         .with_state(state.clone());
 
+    StubServer {
+        base_url: serve(router),
+        received: state.received,
+        authorizations: state.authorizations,
+    }
+}
+
+/// Run `router` on its own thread and port, returning the base URL to point the
+/// binary at.
+fn serve(router: Router) -> String {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -149,12 +162,70 @@ fn start_stub_server(rejected: Vec<Uuid>) -> StubServer {
     std::thread::spawn(move || {
         runtime.block_on(async { axum::serve(listener, router).await.unwrap() });
     });
+    format!("http://{address}")
+}
 
-    StubServer {
-        base_url: format!("http://{address}"),
-        received: state.received,
-        authorizations: state.authorizations,
+#[derive(Clone)]
+struct FormsStubState {
+    since_values: Arc<Mutex<Vec<String>>>,
+    replies: Arc<Mutex<VecDeque<FormsPullResponse>>>,
+}
+
+struct FormsStub {
+    base_url: String,
+    since_values: Arc<Mutex<Vec<String>>>,
+}
+
+impl FormsStub {
+    fn since_values(&self) -> Vec<String> {
+        self.since_values.lock().unwrap().clone()
     }
+}
+
+async fn stub_forms(
+    State(state): State<FormsStubState>,
+    Query(parameters): Query<HashMap<String, String>>,
+) -> Json<FormsPullResponse> {
+    state
+        .since_values
+        .lock()
+        .unwrap()
+        .push(parameters.get("since").cloned().unwrap_or_default());
+    let reply = state
+        .replies
+        .lock()
+        .unwrap()
+        .pop_front()
+        .expect("the stub was asked for more pulls than the test scripted");
+    Json(reply)
+}
+
+/// A forms endpoint that answers each pull with the next scripted response.
+fn start_forms_stub(replies: Vec<FormsPullResponse>) -> FormsStub {
+    let state = FormsStubState {
+        since_values: Arc::new(Mutex::new(Vec::new())),
+        replies: Arc::new(Mutex::new(replies.into())),
+    };
+    let router = Router::new()
+        .route("/api/v1/sync/forms", get(stub_forms))
+        .with_state(state.clone());
+
+    FormsStub {
+        base_url: serve(router),
+        since_values: state.since_values,
+    }
+}
+
+fn forms_reply(forms: Vec<Form>, deleted: Vec<Uuid>, cursor: &str) -> FormsPullResponse {
+    FormsPullResponse {
+        forms,
+        deleted,
+        cursor: cursor.to_string(),
+    }
+}
+
+fn read_forms(path: &Path) -> PulledForms {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
 /// An address nothing is listening on, standing in for a server that is down.
@@ -167,6 +238,10 @@ fn closed_address() -> String {
 
 fn queue_path(directory: &TempDir) -> PathBuf {
     directory.path().join("queue.json")
+}
+
+fn forms_path(directory: &TempDir) -> PathBuf {
+    directory.path().join("forms.json")
 }
 
 #[test]
@@ -350,21 +425,10 @@ fn push_reports_a_rejecting_server_and_keeps_the_item() {
         "/api/v1/sync/push",
         post(|| async { (axum::http::StatusCode::UNAUTHORIZED, "missing bearer token") }),
     );
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let listener =
-        runtime.block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() });
-    let address = listener.local_addr().unwrap();
-    std::thread::spawn(move || {
-        runtime.block_on(async { axum::serve(listener, unauthorized).await.unwrap() });
-    });
-
     let output = run_cli(&[
         "push",
         "--server",
-        &format!("http://{address}"),
+        &serve(unauthorized),
         "--queue",
         path.to_str().unwrap(),
     ]);
@@ -376,6 +440,144 @@ fn push_reports_a_rejecting_server_and_keeps_the_item() {
     let queue = read_queue(&path);
     assert_eq!(item_status(&queue, submission.id), SyncStatus::Failed);
     assert_eq!(queue.items()[0].retry_count, 1);
+}
+
+#[test]
+fn pull_stores_the_forms_and_the_cursor() {
+    let directory = TempDir::new().unwrap();
+    let path = forms_path(&directory);
+    let inspection = Form::new("inspection");
+    let survey = Form::new("survey");
+    let server = start_forms_stub(vec![forms_reply(
+        vec![inspection.clone(), survey.clone()],
+        Vec::new(),
+        "2026-08-31T10:00:00+02:00@7",
+    )]);
+
+    let output = run_cli(&[
+        "pull",
+        "--server",
+        &server.base_url,
+        "--forms",
+        path.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "pull failed: {output:?}");
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert!(report.contains("2 updated, 0 deleted"), "{report}");
+
+    let pulled = read_forms(&path);
+    assert_eq!(pulled.cursor(), "2026-08-31T10:00:00+02:00@7");
+    let stored: Vec<Uuid> = pulled.forms().iter().map(|form| form.id).collect();
+    assert_eq!(stored, vec![inspection.id, survey.id]);
+    assert_eq!(pulled.forms()[0].title, "inspection");
+}
+
+#[test]
+fn pull_sends_the_stored_cursor_on_the_next_run() {
+    let directory = TempDir::new().unwrap();
+    let path = forms_path(&directory);
+    let inspection = Form::new("inspection");
+    let mut updated = inspection.clone();
+    updated.title = "inspection v2".to_string();
+    let server = start_forms_stub(vec![
+        forms_reply(vec![inspection], Vec::new(), "2026-08-31T10:00:00+02:00@7"),
+        forms_reply(vec![updated], Vec::new(), "2026-08-31T11:00:00+02:00@8"),
+    ]);
+
+    for _ in 0..2 {
+        let output = run_cli(&[
+            "pull",
+            "--server",
+            &server.base_url,
+            "--forms",
+            path.to_str().unwrap(),
+        ]);
+        assert!(output.status.success(), "pull failed: {output:?}");
+    }
+
+    // the first pull asks for everything, the second picks up where it stopped.
+    assert_eq!(
+        server.since_values(),
+        vec![String::new(), "2026-08-31T10:00:00+02:00@7".to_string()]
+    );
+    let pulled = read_forms(&path);
+    assert_eq!(pulled.forms().len(), 1);
+    assert_eq!(pulled.forms()[0].title, "inspection v2");
+    assert_eq!(pulled.cursor(), "2026-08-31T11:00:00+02:00@8");
+}
+
+#[test]
+fn pull_drops_a_form_the_server_tombstoned() {
+    let directory = TempDir::new().unwrap();
+    let path = forms_path(&directory);
+    let kept = Form::new("inspection");
+    let deleted = Form::new("survey");
+    let server = start_forms_stub(vec![
+        forms_reply(vec![kept.clone(), deleted.clone()], Vec::new(), "c1"),
+        forms_reply(Vec::new(), vec![deleted.id], "c2"),
+    ]);
+
+    let first = run_cli(&[
+        "pull",
+        "--server",
+        &server.base_url,
+        "--forms",
+        path.to_str().unwrap(),
+    ]);
+    assert!(first.status.success());
+    assert_eq!(read_forms(&path).forms().len(), 2);
+
+    let second = run_cli(&[
+        "pull",
+        "--server",
+        &server.base_url,
+        "--forms",
+        path.to_str().unwrap(),
+    ]);
+    assert!(second.status.success(), "pull failed: {second:?}");
+    let report = String::from_utf8(second.stdout).unwrap();
+    assert!(report.contains("0 updated, 1 deleted"), "{report}");
+
+    let pulled = read_forms(&path);
+    assert_eq!(pulled.forms().len(), 1);
+    assert_eq!(pulled.forms()[0].id, kept.id);
+    assert_eq!(pulled.cursor(), "c2");
+}
+
+#[test]
+fn pull_reports_a_rejecting_server_and_keeps_the_stored_forms() {
+    let directory = TempDir::new().unwrap();
+    let path = forms_path(&directory);
+    let server = start_forms_stub(vec![forms_reply(
+        vec![Form::new("inspection")],
+        Vec::new(),
+        "c1",
+    )]);
+    run_cli(&[
+        "pull",
+        "--server",
+        &server.base_url,
+        "--forms",
+        path.to_str().unwrap(),
+    ]);
+    let before = std::fs::read_to_string(&path).unwrap();
+
+    let unauthorized = Router::new().route(
+        "/api/v1/sync/forms",
+        get(|| async { (axum::http::StatusCode::UNAUTHORIZED, "missing bearer token") }),
+    );
+    let output = run_cli(&[
+        "pull",
+        "--server",
+        &serve(unauthorized),
+        "--forms",
+        path.to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    let message = String::from_utf8(output.stderr).unwrap();
+    assert!(message.contains("401"), "{message}");
+    assert!(message.contains("missing bearer token"), "{message}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 }
 
 #[test]

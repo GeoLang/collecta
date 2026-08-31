@@ -7,11 +7,13 @@ description = "Collecta command-line client — offline submission queue and pus
 
 [dependencies]
 collecta-core = { path = "../collecta-core" }
+serde = "1"
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.13", default-features = false, features = [
     "blocking",
     "json",
+    "query",
     "rustls",
 ] }
 

@@ -6,6 +6,7 @@
 pub mod attachment;
 pub mod error;
 pub mod form;
+pub mod pulled_forms;
 pub mod submission;
 pub mod sync_protocol;
 pub mod sync_queue;
@@ -13,5 +14,6 @@ pub mod validation;
 
 pub use error::Error;
 pub use form::{FieldType, Form, FormField};
+pub use pulled_forms::{PullOutcome, PulledForms};
 pub use submission::{FieldValue, Submission};
 pub use sync_queue::{SyncQueue, SyncStatus};
