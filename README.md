@@ -91,7 +91,7 @@ Ptolemy, which publishing writes to over its REST API.
 
 ### Form Schema
 
-- **20+ field types**: Text, Integer, Decimal, Date, DateTime, Time, Select, MultiSelect, GeoPoint, GeoTrace, GeoShape, Photo, Audio, Video, File, Barcode, Signature, Boolean, Repeat, Note
+- **21 field types**: Text, TextArea, Integer, Decimal, Date, DateTime, Time, Select, MultiSelect, GeoPoint, GeoTrace, GeoShape, Photo, Audio, Video, File, Barcode, Signature, Boolean, Repeat, Note
 - **Validation constraints**: Min/Max value, Min/Max length, glob-style pattern, OneOf
 - **Conditional visibility**: only over the XLSForm path, where the raw `relevant`
   expression is carried as metadata into the XForm bind and evaluated on the device by
@@ -333,7 +333,7 @@ Any other role string is refused everywhere rather than treated as the weakest r
 so an account carrying one can log in and do nothing. `create-user` rejects it.
 
 ```bash
-# seed a user (password read from stdin, role defaults to admin)
+# seed a user (password read from stdin, at least 8 characters, role defaults to admin)
 cargo run -p collecta-server -- create-user admin@example.com
 cargo run -p collecta-server -- create-user field@example.com editor
 
@@ -442,10 +442,11 @@ Environment variables:
 (raw body) and registers the parsed form. The engine models a subset of XLSForm;
 the importer maps what it can and preserves the rest rather than dropping it.
 
-**Supported types** (`survey.type`): `text`/`string`, `integer`, `decimal`,
-`date`, `time`, `dateTime`, `note`, `geopoint`, `geotrace`, `geoshape`, `image`/`photo`,
-`audio`, `video`, `file`, `barcode`, `signature`, `select_one <list>`,
-`select_multiple <list>`, `begin_repeat`/`end_repeat`, `begin_group`/`end_group`.
+**Supported types** (`survey.type`): `text`/`string`, `integer`/`int`, `decimal`,
+`date`, `time`, `dateTime`/`datetime`, `note`, `geopoint`, `geotrace`, `geoshape`,
+`image`/`photo`, `audio`, `video`, `file`, `barcode`, `signature`, `select_one <list>`,
+`select_multiple <list>`/`select_multi <list>`, `begin_repeat`/`end_repeat`,
+`begin_group`/`end_group`.
 
 **Mapping notes:**
 
@@ -483,6 +484,15 @@ cargo test
 # Start server
 cargo run -p collecta-server
 ```
+
+### Container
+
+The `Dockerfile` builds `collecta-server` and runs it as a non-root user on port
+3000, with the sqlite database and the attachment files under `/data`, so mount a
+volume there. `COLLECTA_JWT_SECRET` still has to be supplied. The image declares a
+healthcheck against `/health`. Viewtopia's platform compose builds this image and
+serves it behind an nginx `/collecta/` route, where `COLLECTA_BASE_URL` has to be the
+public prefix rather than the container address.
 
 ### Create a Form
 

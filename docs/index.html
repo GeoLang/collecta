@@ -74,6 +74,7 @@ footer{padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
 <tr><td>Media attachment upload and download</td><td>Working, OpenRosa multipart upload to disk, authenticated download endpoint</td></tr>
 <tr><td>Deletes and tombstones in sync</td><td>Working, deleted forms surface as tombstones on the sync cursor</td></tr>
 <tr><td>Role-based authorization</td><td>Working, admin/editor/viewer enforced in middleware, unknown roles fail closed</td></tr>
+<tr><td>Per-form sharing</td><td>Working, a form's creator grants another account read on that form's submissions and attachments</td></tr>
 <tr><td>Ptolemy geodatabase integration</td><td>Working on demand, <code>POST /api/v1/forms/{id}/publish</code> commits a form's submissions there as versioned features, nothing publishes on its own</td></tr>
 </table>
 </div>
