@@ -14,6 +14,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no integration exists yet, which is the case.
 
 ### Added
+- Conditional visibility is enforced (2026-09-16): `FormField.relevant` was declared
+  and never read. `Condition::evaluate` now answers whether a field is shown, and
+  validation skips a hidden field entirely, neither requiring it nor checking its
+  constraints. An unanswered question is an empty string, as it is in ODK, so a
+  condition on a field the submission omits is false for every operator except
+  `NotEquals`. The XLSForm importer reads six `relevant` shapes into a `Condition`
+  (`${f} = 'v'`, `${f} != 'v'`, `${f} > n`, `${f} < n`, `${f} != ''`, and
+  `selected(${f}, 'v')`) and keeps every raw expression in metadata as before, so an
+  expression it cannot model, `>=` and multi-clause ones included, still reaches
+  Collect unchanged. The XForm renderer writes `relevant` from the condition for a
+  form built through the API, where no raw expression exists; when a field has both,
+  the raw expression wins.
 - `collecta-cli pull` (2026-08-31): fetches form definitions from
   `GET /api/v1/sync/forms` into a second JSON file (`./collecta-forms.json`,
   `$COLLECTA_FORMS` or `--forms <path>`), so a device can pick up a form it was

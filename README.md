@@ -93,9 +93,11 @@ Ptolemy, which publishing writes to over its REST API.
 
 - **21 field types**: Text, TextArea, Integer, Decimal, Date, DateTime, Time, Select, MultiSelect, GeoPoint, GeoTrace, GeoShape, Photo, Audio, Video, File, Barcode, Signature, Boolean, Repeat, Note
 - **Validation constraints**: Min/Max value, Min/Max length, glob-style pattern, OneOf
-- **Conditional visibility**: only over the XLSForm path, where the raw `relevant`
-  expression is carried as metadata into the XForm bind and evaluated on the device by
-  ODK Collect. The form model's own `Condition` type is not read by anything.
+- **Conditional visibility**: a field carrying a `Condition` is validated only when the
+  condition holds against the submission, so a hidden field is neither required nor
+  constraint-checked. The XLSForm importer reads the six single-comparison `relevant`
+  forms into a `Condition` and keeps every raw expression as metadata for the XForm
+  bind, which ODK Collect evaluates on the device.
 - **Repeat groups**: Nested sub-forms for multiple entries (e.g., "list all items
   inspected"). They round-trip through the model, the XForm renderer and the submission
   parser, but validation does not descend into them.
@@ -254,9 +256,11 @@ Forms are generated from the stored form model. Field types map to XForm binds
 `photo`/`audio`/`video`/`file`/`signature`→`binary` uploads, `select_one`→`select1`
 with inline choices, repeats→repeat groups). The `relevant`, `constraint`, and
 `calculation` expressions the XLSForm importer preserved go into the binds, and
-**Collect evaluates them on the device**. Collecta still does not evaluate them
-server-side, so what the server enforces on ingest is only what its own validation
-engine models.
+**Collect evaluates them on the device**. A form built through the API carries no raw
+expression, so a field's `Condition` is rendered into the `relevant` attribute instead;
+where a field has both, the raw expression wins because it can say more. What the
+server enforces on ingest is what its own validation engine models: the constraints,
+plus the `relevant` condition where one was modelled.
 
 The one thing the renderer rewrites is the XLSForm `${name}` shorthand, which is not
 XPath. Like pyxform, it becomes the referenced field's path: absolute
@@ -460,11 +464,18 @@ the importer maps what it can and preserves the rest rather than dropping it.
   inner field keeps its group name under `metadata.group`. `begin_repeat` maps to a
   `Repeat` field with nested children.
 
+- `relevant` becomes a `Condition` the validation engine evaluates when it is one
+  comparison the model covers: `${field} = 'value'`, `${field} != 'value'`,
+  `${field} > number`, `${field} < number`, `${field} != ''` and
+  `selected(${field}, 'value')`. Anything longer, `>=` and `<=` included, is left
+  for Collect.
+
 **Preserved as metadata, not evaluated:** raw `constraint` and `relevant`
 expressions, `constraint_message`, `choice_filter`, `appearance`, `calculation`, and
-the select `list_name` are stored on `FormField.metadata` verbatim. XLSForm
-expression evaluation is not implemented yet, so these are carried through rather
-than enforced.
+the select `list_name` are stored on `FormField.metadata` verbatim. Every `relevant`
+expression is kept here, the modelled ones included, so the XForm bind still carries
+what the author wrote. Constraint and calculation expressions are carried through
+rather than enforced.
 
 **Unsupported:** computed/logic types such as `calculate`, `rank`, and `range` are
 rejected with an error rather than silently coerced.

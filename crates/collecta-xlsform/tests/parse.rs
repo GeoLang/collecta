@@ -1,11 +1,12 @@
 // Build a real .xlsx workbook in-memory, parse it, and validate submissions
 // through the actual collecta-core validation engine.
 
-use collecta_core::form::{FieldType, FormField};
+use collecta_core::form::{ConditionOp, FieldType, FormField};
 use collecta_core::submission::{FieldValue, GeoPoint, Submission};
 use collecta_core::validation::validate;
 use collecta_xlsform::parse_bytes;
 use rust_xlsxwriter::Workbook;
+use serde_json::json;
 
 fn write_sheet(workbook: &mut Workbook, name: &str, rows: &[Vec<&str>]) {
     let sheet = workbook.add_worksheet();
@@ -79,6 +80,144 @@ fn sample_xlsx() -> Vec<u8> {
     write_sheet(&mut workbook, "settings", &settings);
 
     workbook.save_to_buffer().unwrap()
+}
+
+fn relevant_xlsx() -> Vec<u8> {
+    let mut workbook = Workbook::new();
+
+    let survey = vec![
+        vec!["type", "name", "label", "relevant"],
+        vec!["text", "trigger", "Trigger", ""],
+        vec!["integer", "amount", "Amount", ""],
+        vec!["select_multiple colors", "picks", "Picks", ""],
+        vec!["text", "on_equals", "Equals", "${trigger} = 'yes'"],
+        vec!["text", "on_not_equals", "Not equals", "${trigger} != 'yes'"],
+        vec!["text", "on_greater", "Greater", "${amount} > 3"],
+        vec!["text", "on_less", "Less", "${amount} < 10.5"],
+        vec!["text", "on_answered", "Answered", "${trigger} != ''"],
+        vec![
+            "text",
+            "on_selected",
+            "Selected",
+            "selected(${picks}, 'red')",
+        ],
+        vec![
+            "text",
+            "on_two_clauses",
+            "Two clauses",
+            "${trigger} = 'yes' and ${amount} > 3",
+        ],
+        vec!["text", "on_at_least", "At least", "${amount} >= 3"],
+        vec![
+            "text",
+            "on_double_quotes",
+            "Double quotes",
+            "${trigger} = \"yes\"",
+        ],
+        vec!["text", "on_function", "Function", "count(${picks}) > 1"],
+    ];
+    write_sheet(&mut workbook, "survey", &survey);
+
+    let choices = vec![
+        vec!["list_name", "name", "label"],
+        vec!["colors", "red", "Red"],
+        vec!["colors", "green", "Green"],
+    ];
+    write_sheet(&mut workbook, "choices", &choices);
+
+    workbook.save_to_buffer().unwrap()
+}
+
+#[test]
+fn parses_simple_relevant_expressions_into_conditions() {
+    let form = parse_bytes(&relevant_xlsx()).unwrap();
+
+    for (name, field, op, value) in [
+        ("on_equals", "trigger", ConditionOp::Equals, json!("yes")),
+        (
+            "on_not_equals",
+            "trigger",
+            ConditionOp::NotEquals,
+            json!("yes"),
+        ),
+        ("on_greater", "amount", ConditionOp::GreaterThan, json!(3)),
+        ("on_less", "amount", ConditionOp::LessThan, json!(10.5)),
+        (
+            "on_answered",
+            "trigger",
+            ConditionOp::IsNotEmpty,
+            serde_json::Value::Null,
+        ),
+        ("on_selected", "picks", ConditionOp::Contains, json!("red")),
+    ] {
+        let condition = form
+            .field_by_name(name)
+            .unwrap()
+            .relevant
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name} should carry a condition"));
+        assert_eq!(condition.field, field, "{name}");
+        assert_eq!(condition.op, op, "{name}");
+        assert_eq!(condition.value, value, "{name}");
+    }
+}
+
+#[test]
+fn keeps_richer_relevant_expressions_as_raw_metadata_only() {
+    let form = parse_bytes(&relevant_xlsx()).unwrap();
+
+    for (name, raw) in [
+        ("on_two_clauses", "${trigger} = 'yes' and ${amount} > 3"),
+        ("on_at_least", "${amount} >= 3"),
+        ("on_double_quotes", "${trigger} = \"yes\""),
+        ("on_function", "count(${picks}) > 1"),
+    ] {
+        let field = form.field_by_name(name).unwrap();
+        assert!(field.relevant.is_none(), "{name} should not be modelled");
+        assert_eq!(field.metadata.get("relevant").unwrap(), raw, "{name}");
+    }
+
+    // a modelled condition keeps the raw expression too: the xform still carries it.
+    let modelled = form.field_by_name("on_equals").unwrap();
+    assert_eq!(
+        modelled.metadata.get("relevant").unwrap(),
+        "${trigger} = 'yes'"
+    );
+}
+
+#[test]
+fn conditions_hide_fields_from_validation() {
+    let form = parse_bytes(&relevant_xlsx()).unwrap();
+    let mut answered = Submission::new(form.id, form.version);
+    answered.set_value("trigger", FieldValue::Text("yes".into()));
+    answered.set_value("amount", FieldValue::Integer(4));
+    answered.set_value("picks", FieldValue::MultiChoice(vec!["red".into()]));
+
+    // shown fields left blank are still not required, so this must be clean.
+    assert!(validate(&form, &answered).is_empty());
+
+    let shown = |name: &str, submission: &Submission| {
+        form.field_by_name(name)
+            .unwrap()
+            .relevant
+            .as_ref()
+            .unwrap()
+            .evaluate(&submission.values)
+    };
+    assert!(shown("on_equals", &answered));
+    assert!(!shown("on_not_equals", &answered));
+    assert!(shown("on_greater", &answered));
+    assert!(shown("on_less", &answered));
+    assert!(shown("on_answered", &answered));
+    assert!(shown("on_selected", &answered));
+
+    let blank = Submission::new(form.id, form.version);
+    assert!(!shown("on_equals", &blank));
+    assert!(shown("on_not_equals", &blank));
+    assert!(!shown("on_greater", &blank));
+    assert!(!shown("on_less", &blank));
+    assert!(!shown("on_answered", &blank));
+    assert!(!shown("on_selected", &blank));
 }
 
 #[test]
@@ -169,7 +308,9 @@ fn parsed_form_drives_the_validation_engine() {
     let form = parse_bytes(&sample_xlsx()).unwrap();
 
     // valid: all required top-level fields present, select value in the list.
+    // count > 0 is what makes "accessible" relevant, so it is required here.
     let mut ok = Submission::new(form.id, form.version);
+    ok.set_value("count", FieldValue::Integer(2));
     ok.set_value("site_name", FieldValue::Text("Alpha".into()));
     ok.set_value("location", FieldValue::GeoPoint(GeoPoint::new(51.5, -0.1)));
     ok.set_value("accessible", FieldValue::Choice("yes".into()));
@@ -192,6 +333,7 @@ fn parsed_form_drives_the_validation_engine() {
 
     // a select value outside the choice list fails the OneOf constraint.
     let mut bad_choice = Submission::new(form.id, form.version);
+    bad_choice.set_value("count", FieldValue::Integer(2));
     bad_choice.set_value("site_name", FieldValue::Text("Alpha".into()));
     bad_choice.set_value("location", FieldValue::GeoPoint(GeoPoint::new(0.0, 0.0)));
     bad_choice.set_value("accessible", FieldValue::Choice("maybe".into()));

@@ -8,7 +8,7 @@ use axum::http::{Request, StatusCode};
 use axum::response::Response;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use collecta_core::form::{Choice, FieldType, Form, FormField};
+use collecta_core::form::{Choice, Condition, ConditionOp, FieldType, Form, FormField};
 use collecta_core::submission::{FieldValue, GeoPoint, Submission};
 use collecta_server::auth::TokenResponse;
 use collecta_server::openrosa::xform;
@@ -192,6 +192,60 @@ fn xform_rewrites_field_references_to_xpath() {
         !xml.contains("${"),
         "no xlsform shorthand may survive into the document"
     );
+}
+
+#[test]
+fn xform_renders_relevant_from_a_condition_the_form_model_carries() {
+    let mut form = Form::new("Conditions");
+    form.add_field(FormField::text("consent", "Consent given"));
+    form.add_field(FormField::text("colors", "Colors"));
+
+    let gated = |name: &str, condition: Condition| {
+        let mut field = FormField::text(name, name);
+        field.relevant = Some(condition);
+        field
+    };
+    form.add_field(gated(
+        "age",
+        condition("consent", ConditionOp::Equals, serde_json::json!("yes")),
+    ));
+    form.add_field(gated(
+        "score",
+        condition("age", ConditionOp::GreaterThan, serde_json::json!(18)),
+    ));
+    form.add_field(gated(
+        "shade",
+        condition("colors", ConditionOp::Contains, serde_json::json!("red")),
+    ));
+    form.add_field(gated(
+        "reason",
+        condition("consent", ConditionOp::IsNotEmpty, serde_json::Value::Null),
+    ));
+
+    // both kinds present: the raw expression is the richer one, so it wins.
+    let mut both = gated(
+        "detail",
+        condition("consent", ConditionOp::Equals, serde_json::json!("no")),
+    );
+    both.metadata.insert(
+        "relevant".into(),
+        "${consent} = 'yes' and ${colors} != ''".into(),
+    );
+    form.add_field(both);
+
+    let xml = xform::render(&form).unwrap();
+    let doc = parse(&xml);
+    let relevant = |nodeset: &str| collapse(&bind_for(&doc, nodeset).attr("relevant").unwrap());
+
+    assert_eq!(relevant("/data/age"), "/data/consent = 'yes'");
+    assert_eq!(relevant("/data/score"), "/data/age > 18");
+    assert_eq!(relevant("/data/shade"), "selected( /data/colors , 'red')");
+    assert_eq!(relevant("/data/reason"), "/data/consent != ''");
+    assert_eq!(
+        relevant("/data/detail"),
+        "/data/consent = 'yes' and /data/colors != ''"
+    );
+    assert!(!xml.contains("${"));
 }
 
 #[test]
@@ -1837,6 +1891,14 @@ fn element_from(e: &quick_xml::events::BytesStart) -> Element {
             })
             .collect(),
         text: String::new(),
+    }
+}
+
+fn condition(field: &str, op: ConditionOp, value: serde_json::Value) -> Condition {
+    Condition {
+        field: field.to_string(),
+        op,
+        value,
     }
 }
 

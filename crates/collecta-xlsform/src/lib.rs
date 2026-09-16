@@ -16,7 +16,18 @@ use std::fmt;
 use std::io::{Cursor, Read, Seek};
 
 use calamine::{Data, Range, Reader, Xlsx};
-use collecta_core::form::{Choice, Constraint, ConstraintKind, FieldType, Form, FormField};
+use collecta_core::form::{
+    Choice, Condition, ConditionOp, Constraint, ConstraintKind, FieldType, Form, FormField,
+};
+
+const RELEVANT_COLUMN: &str = "relevant";
+
+const RELEVANT_OPERATORS: [(&str, ConditionOp); 4] = [
+    ("!=", ConditionOp::NotEquals),
+    ("=", ConditionOp::Equals),
+    (">", ConditionOp::GreaterThan),
+    ("<", ConditionOp::LessThan),
+];
 
 /// Errors raised while importing an XLSForm.
 #[derive(Debug)]
@@ -262,7 +273,7 @@ fn build_field(
     for key in [
         "constraint",
         "constraint_message",
-        "relevant",
+        RELEVANT_COLUMN,
         "choice_filter",
         "appearance",
         "calculation",
@@ -272,7 +283,71 @@ fn build_field(
         }
     }
 
+    // a modelled condition keeps its raw expression in metadata for the xform bind.
+    if let Some(expression) = field.metadata.get(RELEVANT_COLUMN) {
+        field.relevant = parse_relevant(expression);
+    }
+
     Ok(field)
+}
+
+fn parse_relevant(expression: &str) -> Option<Condition> {
+    let expression = expression.trim();
+    if let Some(arguments) = expression
+        .strip_prefix("selected(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let (reference, value) = arguments.split_once(',')?;
+        return Some(Condition {
+            field: field_reference(reference)?,
+            op: ConditionOp::Contains,
+            value: serde_json::Value::String(quoted_value(value)?),
+        });
+    }
+
+    for (token, op) in RELEVANT_OPERATORS {
+        let Some((reference, right)) = expression.split_once(token) else {
+            continue;
+        };
+        let right = right.trim();
+        // >= and <= are not modelled, and the bare operator would misread them.
+        if right.starts_with('=') {
+            return None;
+        }
+        let field = field_reference(reference)?;
+        let value = match op {
+            ConditionOp::GreaterThan | ConditionOp::LessThan => number_value(right)?,
+            _ => serde_json::Value::String(quoted_value(right)?),
+        };
+        if op == ConditionOp::NotEquals && value == serde_json::Value::String(String::new()) {
+            return Some(Condition {
+                field,
+                op: ConditionOp::IsNotEmpty,
+                value: serde_json::Value::Null,
+            });
+        }
+        return Some(Condition { field, op, value });
+    }
+    None
+}
+
+fn field_reference(token: &str) -> Option<String> {
+    let name = token.trim().strip_prefix("${")?.strip_suffix('}')?;
+    let usable = !name.is_empty() && !name.contains(['$', '{', '}']);
+    usable.then(|| name.to_string())
+}
+
+fn quoted_value(token: &str) -> Option<String> {
+    let inner = token.trim().strip_prefix('\'')?.strip_suffix('\'')?;
+    (!inner.contains('\'')).then(|| inner.to_string())
+}
+
+fn number_value(token: &str) -> Option<serde_json::Value> {
+    let token = token.trim();
+    if let Ok(integer) = token.parse::<i64>() {
+        return Some(serde_json::Value::from(integer));
+    }
+    serde_json::Number::from_f64(token.parse::<f64>().ok()?).map(serde_json::Value::Number)
 }
 
 fn map_type(base: &str) -> Option<FieldType> {

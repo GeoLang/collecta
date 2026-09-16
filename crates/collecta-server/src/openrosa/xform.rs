@@ -14,13 +14,15 @@
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
-use collecta_core::form::{FieldType, Form, FormField};
+use collecta_core::form::{Condition, ConditionOp, FieldType, Form, FormField};
 use md5::{Digest, Md5};
 use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 
 /// Root element of the generated instance. Every nodeset path is rooted here.
 pub const INSTANCE_ROOT: &str = "data";
+
+const RELEVANT_COLUMN: &str = "relevant";
 
 const NS_XFORMS: &str = "http://www.w3.org/2002/xforms";
 const NS_XHTML: &str = "http://www.w3.org/1999/xhtml";
@@ -341,11 +343,21 @@ fn write_bind<W: std::io::Write>(
     if field.field_type == FieldType::Note {
         attrs.push(("readonly", "true()".to_string()));
     }
+    // a raw expression wins over a condition, it can say more.
+    if !field.metadata.contains_key(RELEVANT_COLUMN)
+        && let Some(condition) = &field.relevant
+    {
+        let expression = condition_expression(condition);
+        attrs.push((
+            RELEVANT_COLUMN,
+            rewrite_expression(&expression, scope, index, &field.name)?,
+        ));
+    }
     // xlsform expressions, with their ${name} shorthand resolved to paths.
     // The surrounding xpath is otherwise untouched: collect evaluates it, we
     // do not.
     for (column, attribute) in [
-        ("relevant", "relevant"),
+        (RELEVANT_COLUMN, RELEVANT_COLUMN),
         ("constraint", "constraint"),
         ("calculation", "calculate"),
     ] {
@@ -376,6 +388,38 @@ fn write_bind<W: std::io::Write>(
         }
     }
     Ok(())
+}
+
+// written in ${name} shorthand so the same rewrite resolves the reference.
+fn condition_expression(condition: &Condition) -> String {
+    let reference = format!("${{{}}}", condition.field);
+    let literal = xpath_literal(&condition.value);
+    match condition.op {
+        ConditionOp::Equals => format!("{reference} = {literal}"),
+        ConditionOp::NotEquals => format!("{reference} != {literal}"),
+        ConditionOp::GreaterThan => format!("{reference} > {literal}"),
+        ConditionOp::LessThan => format!("{reference} < {literal}"),
+        ConditionOp::Contains => format!("selected({reference}, {literal})"),
+        ConditionOp::IsNotEmpty => format!("{reference} != ''"),
+    }
+}
+
+fn xpath_literal(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::Null => "''".to_string(),
+        serde_json::Value::String(text) => quoted(text),
+        other => quoted(&other.to_string()),
+    }
+}
+
+// xpath 1.0 cannot escape a quote inside a literal, so delimit with the other one.
+fn quoted(text: &str) -> String {
+    if text.contains('\'') {
+        format!("\"{text}\"")
+    } else {
+        format!("'{text}'")
+    }
 }
 
 /// XForm data type for a field.

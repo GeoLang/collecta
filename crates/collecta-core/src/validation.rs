@@ -25,6 +25,13 @@ pub fn validate(form: &Form, submission: &Submission) -> Vec<Error> {
 }
 
 fn validate_field(field: &FormField, submission: &Submission, errors: &mut Vec<Error>) {
+    // a field the condition hides was never asked, so nothing about it is checked.
+    if let Some(condition) = &field.relevant
+        && !condition.evaluate(&submission.values)
+    {
+        return;
+    }
+
     let value = submission.values.get(&field.name);
 
     // Check required
@@ -157,7 +164,33 @@ fn simple_pattern_match(pattern: &str, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::form::{Constraint, ConstraintKind, FieldType, FormField};
+    use crate::form::{Condition, ConditionOp, Constraint, ConstraintKind, FieldType, FormField};
+
+    fn gated_form(op: ConditionOp, value: serde_json::Value) -> Form {
+        let mut form = Form::new("Gated");
+        form.add_field(FormField::text("trigger", "Trigger"));
+        let mut detail = FormField::text("detail", "Detail")
+            .set_required()
+            .with_constraint(Constraint {
+                kind: ConstraintKind::MaxLength(3),
+                message: "Too long".to_string(),
+            });
+        detail.relevant = Some(Condition {
+            field: "trigger".to_string(),
+            op,
+            value,
+        });
+        form.add_field(detail);
+        form
+    }
+
+    fn errors_with_trigger(form: &Form, trigger: Option<FieldValue>) -> Vec<Error> {
+        let mut sub = Submission::new(form.id, 1);
+        if let Some(value) = trigger {
+            sub.set_value("trigger", value);
+        }
+        validate(form, &sub)
+    }
 
     fn test_form() -> Form {
         let mut form = Form::new("Test");
@@ -230,6 +263,84 @@ mod tests {
         let errors = validate(&form, &sub);
         assert_eq!(errors.len(), 1);
         assert!(matches!(&errors[0], Error::UnknownField(name) if name == "bogus"));
+    }
+
+    #[test]
+    fn test_relevant_field_is_checked_when_the_condition_holds() {
+        let form = gated_form(ConditionOp::Equals, serde_json::json!("yes"));
+        let errors = errors_with_trigger(&form, Some(FieldValue::Text("yes".to_string())));
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(matches!(&errors[0], Error::RequiredField(name) if name == "detail"));
+    }
+
+    #[test]
+    fn test_irrelevant_field_skips_required_and_constraints() {
+        let form = gated_form(ConditionOp::Equals, serde_json::json!("yes"));
+        let mut sub = Submission::new(form.id, 1);
+        sub.set_value("trigger", FieldValue::Text("no".to_string()));
+        sub.set_value("detail", FieldValue::Text("far too long".to_string()));
+
+        let errors = validate(&form, &sub);
+        assert!(errors.is_empty(), "got: {errors:?}");
+    }
+
+    #[test]
+    fn test_relevant_field_still_fails_its_constraint() {
+        let form = gated_form(ConditionOp::Equals, serde_json::json!("yes"));
+        let mut sub = Submission::new(form.id, 1);
+        sub.set_value("trigger", FieldValue::Text("yes".to_string()));
+        sub.set_value("detail", FieldValue::Text("far too long".to_string()));
+
+        let errors = validate(&form, &sub);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(matches!(&errors[0], Error::ValidationFailed { field, .. } if field == "detail"));
+    }
+
+    // an unanswered question is an empty string in odk, so only != is true of it.
+    #[test]
+    fn test_absent_controlling_field_hides_every_condition_but_not_equals() {
+        for (op, value, shown) in [
+            (ConditionOp::Equals, serde_json::json!("yes"), false),
+            (ConditionOp::NotEquals, serde_json::json!("yes"), true),
+            (ConditionOp::GreaterThan, serde_json::json!(0), false),
+            (ConditionOp::LessThan, serde_json::json!(10), false),
+            (ConditionOp::Contains, serde_json::json!("red"), false),
+            (ConditionOp::IsNotEmpty, serde_json::Value::Null, false),
+        ] {
+            let form = gated_form(op.clone(), value);
+            let errors = errors_with_trigger(&form, None);
+            assert_eq!(
+                !errors.is_empty(),
+                shown,
+                "{op:?} with an absent trigger should be shown: {shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_empty_answer_matches_an_absent_one() {
+        let form = gated_form(ConditionOp::IsNotEmpty, serde_json::Value::Null);
+        let errors = errors_with_trigger(&form, Some(FieldValue::Text(String::new())));
+        assert!(errors.is_empty(), "got: {errors:?}");
+
+        let answered = errors_with_trigger(&form, Some(FieldValue::Text("x".to_string())));
+        assert_eq!(answered.len(), 1, "got: {answered:?}");
+    }
+
+    #[test]
+    fn test_numeric_and_multichoice_conditions() {
+        let over_ten = gated_form(ConditionOp::GreaterThan, serde_json::json!(10));
+        assert!(errors_with_trigger(&over_ten, Some(FieldValue::Integer(4))).is_empty());
+        assert_eq!(
+            errors_with_trigger(&over_ten, Some(FieldValue::Integer(11))).len(),
+            1
+        );
+
+        let picked_red = gated_form(ConditionOp::Contains, serde_json::json!("red"));
+        let others = FieldValue::MultiChoice(vec!["green".to_string(), "blue".to_string()]);
+        assert!(errors_with_trigger(&picked_red, Some(others)).is_empty());
+        let with_red = FieldValue::MultiChoice(vec!["green".to_string(), "red".to_string()]);
+        assert_eq!(errors_with_trigger(&picked_red, Some(with_red)).len(), 1);
     }
 
     #[test]

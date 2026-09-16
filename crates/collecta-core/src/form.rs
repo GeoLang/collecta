@@ -3,10 +3,12 @@
 //! Forms are schema-driven: each form has a list of typed fields with
 //! validation rules, conditional visibility, and grouping.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::submission::FieldValue;
 
 /// A complete form definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +190,64 @@ pub struct Condition {
     pub op: ConditionOp,
     /// Value to compare against.
     pub value: serde_json::Value,
+}
+
+impl Condition {
+    pub fn evaluate(&self, values: &HashMap<String, FieldValue>) -> bool {
+        let answer = values.get(&self.field);
+        let text = answer.and_then(field_text).unwrap_or_default();
+        let expected = json_text(&self.value);
+        match self.op {
+            ConditionOp::Equals => text == expected,
+            ConditionOp::NotEquals => text != expected,
+            ConditionOp::GreaterThan => {
+                compare_numbers(&text, &expected, |left, right| left > right)
+            }
+            ConditionOp::LessThan => compare_numbers(&text, &expected, |left, right| left < right),
+            ConditionOp::Contains => text.split_whitespace().any(|token| token == expected),
+            ConditionOp::IsNotEmpty => match answer {
+                None | Some(FieldValue::Null) => false,
+                Some(value) => field_text(value).is_none_or(|text| !text.is_empty()),
+            },
+        }
+    }
+}
+
+// the string an answer compares as, matching what an xform node would hold.
+fn field_text(value: &FieldValue) -> Option<String> {
+    match value {
+        FieldValue::Text(text)
+        | FieldValue::Date(text)
+        | FieldValue::DateTime(text)
+        | FieldValue::Time(text)
+        | FieldValue::Choice(text)
+        | FieldValue::Barcode(text) => Some(text.clone()),
+        FieldValue::Integer(number) => Some(number.to_string()),
+        FieldValue::Decimal(number) => Some(number.to_string()),
+        FieldValue::Boolean(flag) => Some(flag.to_string()),
+        FieldValue::MultiChoice(values) => Some(values.join(" ")),
+        FieldValue::GeoPoint(_)
+        | FieldValue::GeoTrace(_)
+        | FieldValue::GeoShape(_)
+        | FieldValue::Attachment(_)
+        | FieldValue::Repeat(_)
+        | FieldValue::Null => None,
+    }
+}
+
+fn json_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn compare_numbers(left: &str, right: &str, ordered: fn(f64, f64) -> bool) -> bool {
+    let (Ok(left), Ok(right)) = (left.trim().parse::<f64>(), right.trim().parse::<f64>()) else {
+        return false;
+    };
+    ordered(left, right)
 }
 
 /// Condition operators.
