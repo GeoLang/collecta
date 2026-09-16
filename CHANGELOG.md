@@ -33,7 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   zero-based index into the instance list the submission carries. A child's condition
   resolves its controlling field in its own instance first and the top-level values
   after, which is how ODK reads a reference inside a repeat. Nested repeats come out
-  of the same walk.
+  of the same walk. An instance key no child declares is an unknown field on the same
+  path, which it already was at the top level, and a required repeat holding no
+  instances is now a missing field rather than a silent pass. Collect has no such
+  rule, `required` there asks a question for a non-empty value and a repeat's count is
+  driven by `repeat_count`, so this is the server being stricter than the device.
 - `collecta-cli pull` (2026-08-31): fetches form definitions from
   `GET /api/v1/sync/forms` into a second JSON file (`./collecta-forms.json`,
   `$COLLECTA_FORMS` or `--forms <path>`), so a device can pick up a form it was

@@ -47,6 +47,7 @@ fn validate_field(
             None => true,
             Some(FieldValue::Null) => true,
             Some(FieldValue::Text(s)) => s.is_empty(),
+            Some(FieldValue::Repeat(instances)) => instances.is_empty(),
             _ => false,
         };
         if is_empty {
@@ -96,6 +97,16 @@ fn validate_instances(
         for child in repeat.children.iter().flatten() {
             let child_path = format!("{path}[{index}].{}", child.name);
             validate_field(child, &scope, &child_path, errors);
+        }
+        for key in instance.keys() {
+            let known = repeat
+                .children
+                .iter()
+                .flatten()
+                .any(|child| &child.name == key);
+            if !known {
+                errors.push(Error::UnknownField(format!("{path}[{index}].{key}")));
+            }
         }
     }
 }
@@ -370,6 +381,47 @@ mod tests {
             matches!(&errors[0], Error::ValidationFailed { field, .. } if field == "samples[1].depth"),
             "got: {errors:?}"
         );
+    }
+
+    #[test]
+    fn test_unknown_key_inside_an_instance_names_the_row() {
+        let form = repeat_form();
+        let sub = submission_with(
+            &form,
+            vec![
+                instance(&[("sample_id", text("A1"))]),
+                instance(&[("sample_id", text("A2")), ("bogus", text("x"))]),
+            ],
+        );
+
+        let errors = validate(&form, &sub);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(
+            matches!(&errors[0], Error::UnknownField(path) if path == "samples[1].bogus"),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_required_repeat_with_no_instances_is_missing() {
+        let mut form = repeat_form();
+        let samples = form
+            .fields
+            .iter_mut()
+            .find(|field| field.name == "samples")
+            .unwrap();
+        samples.required = true;
+
+        let empty = submission_with(&form, Vec::new());
+        let errors = validate(&form, &empty);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(
+            matches!(&errors[0], Error::RequiredField(path) if path == "samples"),
+            "got: {errors:?}"
+        );
+
+        let filled = submission_with(&form, vec![instance(&[("sample_id", text("A1"))])]);
+        assert!(validate(&form, &filled).is_empty());
     }
 
     #[test]

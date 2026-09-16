@@ -128,7 +128,9 @@ in a file between runs.
 A repeat's children are checked once per instance, and a failure there is reported as
 `repeat[index].child` with a zero-based index, so a client can point at the row. A
 child's condition reads its own instance first and the top-level values after, the way
-ODK resolves a reference inside a repeat. Defaults are not applied: a field's `default`
+ODK resolves a reference inside a repeat. An instance key no child declares is an
+unknown field, as it is at the top level, and a required repeat with no instances is a
+missing field. Defaults are not applied: a field's `default`
 is imported and stored, but nothing substitutes it on ingest and the XForm renderer
 emits empty instance nodes, so it never reaches Collect.
 
