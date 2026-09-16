@@ -100,7 +100,7 @@ Ptolemy, which publishing writes to over its REST API.
   bind, which ODK Collect evaluates on the device.
 - **Repeat groups**: Nested sub-forms for multiple entries (e.g., "list all items
   inspected"). They round-trip through the model, the XForm renderer and the submission
-  parser, but validation does not descend into them.
+  parser, and validation checks each instance's children.
 - **Help text**: Per-field hints for data collectors
 
 ### Offline Sync Queue
@@ -125,10 +125,12 @@ in a file between runs.
 - Unknown field detection
 - Full error reporting (all errors returned, not just first)
 
-All of it applies to top-level fields only. Validation does not recurse into a repeat's
-children, so a required field inside a repeat is not enforced. Defaults are not applied
-either: a field's `default` is imported and stored, but nothing substitutes it on ingest
-and the XForm renderer emits empty instance nodes, so it never reaches Collect.
+A repeat's children are checked once per instance, and a failure there is reported as
+`repeat[index].child` with a zero-based index, so a client can point at the row. A
+child's condition reads its own instance first and the top-level values after, the way
+ODK resolves a reference inside a repeat. Defaults are not applied: a field's `default`
+is imported and stored, but nothing substitutes it on ingest and the XForm renderer
+emits empty instance nodes, so it never reaches Collect.
 
 ### REST API
 

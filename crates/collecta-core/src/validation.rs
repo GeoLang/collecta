@@ -1,7 +1,9 @@
 //! Form validation — enforce constraints and required fields.
 
+use std::collections::HashMap;
+
 use crate::error::Error;
-use crate::form::{ConstraintKind, Form, FormField};
+use crate::form::{ConstraintKind, FieldType, Form, FormField};
 use crate::submission::{FieldValue, Submission};
 
 /// Validate a submission against its form schema.
@@ -11,7 +13,7 @@ pub fn validate(form: &Form, submission: &Submission) -> Vec<Error> {
     let mut errors = Vec::new();
 
     for field in &form.fields {
-        validate_field(field, submission, &mut errors);
+        validate_field(field, &submission.values, &field.name, &mut errors);
     }
 
     // Check for unknown fields
@@ -24,15 +26,20 @@ pub fn validate(form: &Form, submission: &Submission) -> Vec<Error> {
     errors
 }
 
-fn validate_field(field: &FormField, submission: &Submission, errors: &mut Vec<Error>) {
+fn validate_field(
+    field: &FormField,
+    values: &HashMap<String, FieldValue>,
+    path: &str,
+    errors: &mut Vec<Error>,
+) {
     // a field the condition hides was never asked, so nothing about it is checked.
     if let Some(condition) = &field.relevant
-        && !condition.evaluate(&submission.values)
+        && !condition.evaluate(values)
     {
         return;
     }
 
-    let value = submission.values.get(&field.name);
+    let value = values.get(&field.name);
 
     // Check required
     if field.required {
@@ -43,9 +50,17 @@ fn validate_field(field: &FormField, submission: &Submission, errors: &mut Vec<E
             _ => false,
         };
         if is_empty {
-            errors.push(Error::RequiredField(field.name.clone()));
+            errors.push(Error::RequiredField(path.to_string()));
             return;
         }
+    }
+
+    // a repeat holds instances rather than a value of its own.
+    if field.field_type == FieldType::Repeat {
+        if let Some(FieldValue::Repeat(instances)) = value {
+            validate_instances(field, instances, values, path, errors);
+        }
+        return;
     }
 
     // Skip constraint checks if value is absent/null
@@ -56,14 +71,37 @@ fn validate_field(field: &FormField, submission: &Submission, errors: &mut Vec<E
 
     // Apply constraints
     for constraint in &field.constraints {
-        if let Some(err) = check_constraint(field, value, constraint) {
+        if let Some(err) = check_constraint(path, value, constraint) {
             errors.push(err);
         }
     }
 }
 
+fn validate_instances(
+    repeat: &FormField,
+    instances: &[HashMap<String, FieldValue>],
+    outer: &HashMap<String, FieldValue>,
+    path: &str,
+    errors: &mut Vec<Error>,
+) {
+    for (index, instance) in instances.iter().enumerate() {
+        // a child reads its own instance first, so a name it does not answer
+        // resolves to the field outside the repeat.
+        let mut scope = outer.clone();
+        scope.extend(
+            instance
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone())),
+        );
+        for child in repeat.children.iter().flatten() {
+            let child_path = format!("{path}[{index}].{}", child.name);
+            validate_field(child, &scope, &child_path, errors);
+        }
+    }
+}
+
 fn check_constraint(
-    field: &FormField,
+    path: &str,
     value: &FieldValue,
     constraint: &crate::form::Constraint,
 ) -> Option<Error> {
@@ -72,7 +110,7 @@ fn check_constraint(
             let num = extract_number(value)?;
             if num < *min {
                 return Some(Error::ValidationFailed {
-                    field: field.name.clone(),
+                    field: path.to_string(),
                     reason: constraint.message.clone(),
                 });
             }
@@ -81,7 +119,7 @@ fn check_constraint(
             let num = extract_number(value)?;
             if num > *max {
                 return Some(Error::ValidationFailed {
-                    field: field.name.clone(),
+                    field: path.to_string(),
                     reason: constraint.message.clone(),
                 });
             }
@@ -90,7 +128,7 @@ fn check_constraint(
             let len = extract_length(value)?;
             if len < *min {
                 return Some(Error::ValidationFailed {
-                    field: field.name.clone(),
+                    field: path.to_string(),
                     reason: constraint.message.clone(),
                 });
             }
@@ -99,7 +137,7 @@ fn check_constraint(
             let len = extract_length(value)?;
             if len > *max {
                 return Some(Error::ValidationFailed {
-                    field: field.name.clone(),
+                    field: path.to_string(),
                     reason: constraint.message.clone(),
                 });
             }
@@ -109,7 +147,7 @@ fn check_constraint(
                 // Simple glob-style match (not full regex to avoid dependency)
                 if !simple_pattern_match(pattern, text) {
                     return Some(Error::ValidationFailed {
-                        field: field.name.clone(),
+                        field: path.to_string(),
                         reason: constraint.message.clone(),
                     });
                 }
@@ -123,7 +161,7 @@ fn check_constraint(
             };
             if !allowed.iter().any(|a| a == text) {
                 return Some(Error::ValidationFailed {
-                    field: field.name.clone(),
+                    field: path.to_string(),
                     reason: constraint.message.clone(),
                 });
             }
@@ -190,6 +228,164 @@ mod tests {
             sub.set_value("trigger", value);
         }
         validate(form, &sub)
+    }
+
+    fn repeat_form() -> Form {
+        let mut form = Form::new("Samples");
+        form.add_field(FormField::text("audit", "Audit"));
+
+        let mut lab_ref = FormField::text("lab_ref", "Lab reference").set_required();
+        lab_ref.relevant = Some(Condition {
+            field: "needs_lab".to_string(),
+            op: ConditionOp::Equals,
+            value: serde_json::json!("yes"),
+        });
+
+        let mut audit_note = FormField::text("audit_note", "Audit note").set_required();
+        audit_note.relevant = Some(Condition {
+            field: "audit".to_string(),
+            op: ConditionOp::Equals,
+            value: serde_json::json!("yes"),
+        });
+
+        let mut depth = FormField::text("depth", "Depth").with_constraint(Constraint {
+            kind: ConstraintKind::Max(10.0),
+            message: "Deeper than the corer".to_string(),
+        });
+        depth.field_type = FieldType::Integer;
+
+        let mut samples = FormField::text("samples", "Samples");
+        samples.field_type = FieldType::Repeat;
+        samples.children = Some(vec![
+            FormField::text("sample_id", "Sample id").set_required(),
+            FormField::text("needs_lab", "Needs lab"),
+            lab_ref,
+            audit_note,
+            depth,
+        ]);
+        form.add_field(samples);
+        form
+    }
+
+    fn instance(answers: &[(&str, FieldValue)]) -> std::collections::HashMap<String, FieldValue> {
+        answers
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), value.clone()))
+            .collect()
+    }
+
+    fn text(value: &str) -> FieldValue {
+        FieldValue::Text(value.to_string())
+    }
+
+    fn submission_with(
+        form: &Form,
+        instances: Vec<std::collections::HashMap<String, FieldValue>>,
+    ) -> Submission {
+        let mut sub = Submission::new(form.id, 1);
+        sub.set_value("samples", FieldValue::Repeat(instances));
+        sub
+    }
+
+    #[test]
+    fn test_required_child_fails_only_the_instance_that_omits_it() {
+        let form = repeat_form();
+        let sub = submission_with(
+            &form,
+            vec![
+                instance(&[("sample_id", text("A1"))]),
+                instance(&[("needs_lab", text("no"))]),
+            ],
+        );
+
+        let errors = validate(&form, &sub);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(
+            matches!(&errors[0], Error::RequiredField(path) if path == "samples[1].sample_id"),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_child_condition_reads_its_own_instance() {
+        let form = repeat_form();
+        let sub = submission_with(
+            &form,
+            vec![
+                instance(&[("sample_id", text("A1")), ("needs_lab", text("yes"))]),
+                instance(&[("sample_id", text("A2")), ("needs_lab", text("no"))]),
+            ],
+        );
+
+        let errors = validate(&form, &sub);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(
+            matches!(&errors[0], Error::RequiredField(path) if path == "samples[0].lab_ref"),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_child_condition_reads_a_top_level_field() {
+        let form = repeat_form();
+        let instances = vec![
+            instance(&[("sample_id", text("A1"))]),
+            instance(&[("sample_id", text("A2"))]),
+        ];
+
+        let mut audited = submission_with(&form, instances.clone());
+        audited.set_value("audit", text("yes"));
+        let errors = validate(&form, &audited);
+        let paths: Vec<String> = errors
+            .iter()
+            .map(|error| match error {
+                Error::RequiredField(path) => path.clone(),
+                other => panic!("unexpected error: {other:?}"),
+            })
+            .collect();
+        assert_eq!(paths, ["samples[0].audit_note", "samples[1].audit_note"]);
+
+        let mut unaudited = submission_with(&form, instances);
+        unaudited.set_value("audit", text("no"));
+        assert!(validate(&form, &unaudited).is_empty());
+    }
+
+    #[test]
+    fn test_child_constraint_names_the_instance() {
+        let form = repeat_form();
+        let sub = submission_with(
+            &form,
+            vec![
+                instance(&[("sample_id", text("A1")), ("depth", FieldValue::Integer(4))]),
+                instance(&[
+                    ("sample_id", text("A2")),
+                    ("depth", FieldValue::Integer(40)),
+                ]),
+            ],
+        );
+
+        let errors = validate(&form, &sub);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(
+            matches!(&errors[0], Error::ValidationFailed { field, .. } if field == "samples[1].depth"),
+            "got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_sibling_answer_beats_a_top_level_field_of_the_same_name() {
+        let mut form = repeat_form();
+        form.add_field(FormField::text("needs_lab", "Needs lab"));
+        let mut sub = submission_with(
+            &form,
+            vec![instance(&[
+                ("sample_id", text("A1")),
+                ("needs_lab", text("no")),
+            ])],
+        );
+        sub.set_value("needs_lab", text("yes"));
+
+        assert!(validate(&form, &sub).is_empty());
     }
 
     fn test_form() -> Form {

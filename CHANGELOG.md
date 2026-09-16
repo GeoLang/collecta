@@ -24,8 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `selected(${f}, 'v')`) and keeps every raw expression in metadata as before, so an
   expression it cannot model, `>=` and multi-clause ones included, still reaches
   Collect unchanged. The XForm renderer writes `relevant` from the condition for a
-  form built through the API, where no raw expression exists; when a field has both,
+  form built through the API, where no raw expression exists. When a field has both,
   the raw expression wins.
+- Repeat children are validated (2026-09-16): `validate` walks every instance of a
+  `FieldValue::Repeat` against the repeat's children, so a required child, a
+  constraint and a `relevant` condition inside a repeat are enforced instead of
+  ignored. A child failure names the row it came from, `samples[1].sample_id`, with a
+  zero-based index into the instance list the submission carries. A child's condition
+  resolves its controlling field in its own instance first and the top-level values
+  after, which is how ODK reads a reference inside a repeat. Nested repeats come out
+  of the same walk.
 - `collecta-cli pull` (2026-08-31): fetches form definitions from
   `GET /api/v1/sync/forms` into a second JSON file (`./collecta-forms.json`,
   `$COLLECTA_FORMS` or `--forms <path>`), so a device can pick up a form it was
