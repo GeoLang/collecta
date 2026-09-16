@@ -41,13 +41,12 @@ fn validate_field(
 
     let value = values.get(&field.name);
 
-    // Check required
+    // xforms scopes required to a question, so a repeat with no instances passes.
     if field.required {
         let is_empty = match value {
             None => true,
             Some(FieldValue::Null) => true,
             Some(FieldValue::Text(s)) => s.is_empty(),
-            Some(FieldValue::Repeat(instances)) => instances.is_empty(),
             _ => false,
         };
         if is_empty {
@@ -402,8 +401,9 @@ mod tests {
         );
     }
 
+    // refusing this strands a record collect already accepted.
     #[test]
-    fn test_required_repeat_with_no_instances_is_missing() {
+    fn test_required_repeat_with_no_instances_passes() {
         let mut form = repeat_form();
         let samples = form
             .fields
@@ -413,11 +413,9 @@ mod tests {
         samples.required = true;
 
         let empty = submission_with(&form, Vec::new());
-        let errors = validate(&form, &empty);
-        assert_eq!(errors.len(), 1, "got: {errors:?}");
         assert!(
-            matches!(&errors[0], Error::RequiredField(path) if path == "samples"),
-            "got: {errors:?}"
+            validate(&form, &empty).is_empty(),
+            "a required repeat with no instances must pass"
         );
 
         let filled = submission_with(&form, vec![instance(&[("sample_id", text("A1"))])]);
