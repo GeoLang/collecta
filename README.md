@@ -129,9 +129,10 @@ A repeat's children are checked once per instance, and a failure there is report
 `repeat[index].child` with a zero-based index, so a client can point at the row. A
 child's condition reads its own instance first and the top-level values after, the way
 ODK resolves a reference inside a repeat. An instance key no child declares is an
-unknown field, as it is at the top level. A repeat with no instances passes even when
-the form marks it required, because XForms scopes `required` to a question and Collect
-submits such a repeat. Defaults are not applied: a field's `default`
+unknown field, as it is at the top level. A repeat never fails a required check,
+whether the submission carries an empty instance list or no key at all, because XForms
+scopes `required` to a question and Collect submits a repeat nobody added a row to.
+Defaults are not applied: a field's `default`
 is imported and stored, but nothing substitutes it on ingest and the XForm renderer
 emits empty instance nodes, so it never reaches Collect.
 

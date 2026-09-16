@@ -11,7 +11,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use collecta_core::form::{Choice, Condition, ConditionOp, FieldType, Form, FormField};
 use collecta_core::submission::{FieldValue, GeoPoint, Submission};
 use collecta_server::auth::TokenResponse;
-use collecta_server::openrosa::xform;
+use collecta_server::openrosa::{instance, xform};
 use collecta_server::store::{FormWriter, Store, UserRecord};
 use collecta_server::{Config, router};
 use quick_xml::events::Event;
@@ -1116,6 +1116,36 @@ async fn only_accounts_that_may_write_can_submit() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     assert!(store.list_submissions(form.id).await.unwrap().is_empty());
+}
+
+#[test]
+fn a_collect_submission_with_no_repeat_instances_validates() {
+    let mut form = Form::new("Households");
+    form.add_field(FormField::text("household", "Household").set_required());
+    let mut children = FormField::text("child", "Children");
+    children.field_type = FieldType::Repeat;
+    children.required = true;
+    children.children = Some(vec![
+        FormField::text("child_name", "Child name").set_required(),
+    ]);
+    form.add_field(children);
+
+    // collect leaves the repeat out entirely when the enumerator added no rows.
+    let xml = instance_xml(
+        form.id,
+        "uuid:22222222-2222-2222-2222-222222222222",
+        "<household>Alpha</household>",
+    );
+    let parsed = instance::parse(xml.as_bytes()).expect("instance parses");
+    let (submission, coercion_errors) = instance::to_submission(&parsed, &form, TEST_EMAIL);
+    assert!(coercion_errors.is_empty(), "got: {coercion_errors:?}");
+    assert!(!submission.values.contains_key("child"));
+
+    let errors = collecta_core::validation::validate(&form, &submission);
+    assert!(
+        errors.is_empty(),
+        "a repeat collect sent no instances of must not be refused, got: {errors:?}"
+    );
 }
 
 // ---- attachments -------------------------------------------------------

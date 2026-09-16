@@ -34,9 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolves its controlling field in its own instance first and the top-level values
   after, which is how ODK reads a reference inside a repeat. Nested repeats come out
   of the same walk. An instance key no child declares is an unknown field on the same
-  path, which it already was at the top level. A repeat holding no instances still
-  passes a required check: XForms scopes `required` to a question and a repeat's count
-  is driven by `repeat_count`, so refusing one would strand a record Collect accepted.
+  path, which it already was at the top level. A repeat never fails a required check,
+  with an empty instance list or with no key at all, which is the shape Collect sends
+  when the enumerator added no rows. XForms scopes `required` to a question and a
+  repeat's count is driven by `repeat_count`, so refusing one would strand a record
+  the device had already accepted.
 - `collecta-cli pull` (2026-08-31): fetches form definitions from
   `GET /api/v1/sync/forms` into a second JSON file (`./collecta-forms.json`,
   `$COLLECTA_FORMS` or `--forms <path>`), so a device can pick up a form it was

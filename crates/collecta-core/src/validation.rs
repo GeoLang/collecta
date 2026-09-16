@@ -41,8 +41,8 @@ fn validate_field(
 
     let value = values.get(&field.name);
 
-    // xforms scopes required to a question, so a repeat with no instances passes.
-    if field.required {
+    // xforms scopes required to a question, so a repeat never fails this.
+    if field.required && field.field_type != FieldType::Repeat {
         let is_empty = match value {
             None => true,
             Some(FieldValue::Null) => true,
@@ -416,6 +416,12 @@ mod tests {
         assert!(
             validate(&form, &empty).is_empty(),
             "a required repeat with no instances must pass"
+        );
+
+        let absent = Submission::new(form.id, 1);
+        assert!(
+            validate(&form, &absent).is_empty(),
+            "a required repeat with no key at all must pass"
         );
 
         let filled = submission_with(&form, vec![instance(&[("sample_id", text("A1"))])]);
