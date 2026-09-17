@@ -112,7 +112,7 @@ in a file between runs.
 - **Exponential backoff retry**: 5s → 10s → 20s → 40s → ... capped at 5min. A failed
   item is left out of the push batch until its wait has passed.
 - **Max retries** with permanent failure status after threshold
-- **Status tracking**: Pending, Synced, Failed, Abandoned
+- **Status tracking**: Pending, InProgress, Synced, Failed, Abandoned
 - Submissions only. Attachment sync is not implemented on either side.
 
 ### Validation Engine
