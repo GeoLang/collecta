@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Public docs audited against the code (2026-09-16): the README said `cargo test`
+  runs 142, it runs 160. docs/index.html said `SyncQueue` keeps submissions on
+  disk; the type holds them in memory and serializes, and `collecta-cli` is what
+  writes the file.
 - Docs page brought current (2026-08-14): attachments, tombstones, role
   enforcement and the OpenRosa layer were still listed as missing on
   docs/index.html after all four shipped. The README's ViewTopia row now says

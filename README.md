@@ -33,7 +33,7 @@ per-form grant checks, form CRUD including deletes, submission validation and in
 attachment download, XLSForm import, the push/pull sync endpoints, an OpenRosa
 compatibility layer that ODK Collect can submit to, publishing a form's submissions into
 a Ptolemy dataset, and the `collecta-cli` client that queues and pushes submissions and
-pulls form definitions. All are covered by tests (`cargo test` runs 142).
+pulls form definitions. All are covered by tests (`cargo test` runs 160).
 
 **Not built yet:**
 

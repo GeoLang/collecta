@@ -46,7 +46,7 @@ footer{padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
 <h2>Features</h2>
 <div class="grid">
 <div class="card"><h3>📝 Form Schemas</h3><p>20+ field types with validation constraints and XLSForm-compatible structure. A field hidden by its condition is skipped on validation, and expressions the model cannot hold are still carried into the XForm for ODK Collect to evaluate.</p></div>
-<div class="card"><h3>📡 Sync Protocol</h3><p>Idempotent submission push and cursor-based form pull. The <code>SyncQueue</code> type keeps submissions on disk and retries with exponential backoff; <code>collecta-cli</code> drives it from the command line.</p></div>
+<div class="card"><h3>📡 Sync Protocol</h3><p>Idempotent submission push and cursor-based form pull. The <code>SyncQueue</code> type holds queued submissions in memory and schedules retries with exponential backoff. It serializes, so <code>collecta-cli</code> keeps it in a file between runs.</p></div>
 <div class="card"><h3>📎 Attachments</h3><p>Photo, audio, video, file, and signature parts arrive as multipart parts on the OpenRosa submission endpoint, are stored on disk, and download from <code>/api/v1/attachments/{id}</code>.</p></div>
 <div class="card"><h3>📱 OpenRosa</h3><p>formList, form.xml, and multipart submission endpoints with a Basic auth challenge, so ODK Collect works as the field client today.</p></div>
 <div class="card"><h3>🌍 GPS Field Types</h3><p>Point, trace, and shape geometry types in the form model, with latitude, longitude, altitude, and accuracy. Capture happens in the client.</p></div>
