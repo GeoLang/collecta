@@ -84,6 +84,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
+        with:
+          # the docker job uploads a *.dockerbuild build record this action cannot extract
+          pattern: "!*.dockerbuild"
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
