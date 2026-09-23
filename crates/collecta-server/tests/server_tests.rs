@@ -172,9 +172,7 @@ async fn submissions_survive_restart() {
     assert_eq!(subs.len(), 1);
     assert_eq!(subs[0].id, sub_id);
 
-    let counts = store.sync_counts().await.unwrap();
-    assert_eq!(counts.pending, 1);
-    assert_eq!(counts.total, 1);
+    assert_eq!(store.submission_count().await.unwrap(), 1);
 }
 
 #[tokio::test]
@@ -222,8 +220,7 @@ async fn http_submit_list_and_sync_status() {
         .await
         .unwrap();
     let status = body_string(resp).await;
-    assert!(status.contains("\"pending\":1"), "got {status}");
-    assert!(status.contains("\"total\":1"), "got {status}");
+    assert_eq!(status, r#"{"submissions":1}"#);
 }
 
 #[tokio::test]
@@ -723,7 +720,7 @@ async fn sync_status_is_admin_only_and_the_form_pull_is_not() {
     assert_eq!(create_form(&app, &a, &form_a).await, StatusCode::CREATED);
     assert_eq!(create_form(&app, &b, &form_b).await, StatusCode::CREATED);
 
-    // queue counts cover the whole instance, so they are admin-only.
+    // submission counts cover the whole instance, so they are admin-only.
     let resp = app
         .clone()
         .oneshot(get("/api/v1/sync/status", &a))
@@ -924,8 +921,7 @@ async fn deleting_a_form_tombstones_it_and_takes_its_data_with_it() {
         !std::path::Path::new(&file).exists(),
         "{file} still on disk"
     );
-    let counts = store.sync_counts().await.unwrap();
-    assert_eq!(counts.total, 0, "the queue entry went with the submission");
+    assert_eq!(store.submission_count().await.unwrap(), 0);
 
     // and the delete reaches a client that already pulled the form.
     let resp = app
@@ -1008,7 +1004,7 @@ async fn deleting_a_submission_leaves_the_form_and_the_other_submissions() {
             .status(),
         StatusCode::NOT_FOUND
     );
-    assert_eq!(store.sync_counts().await.unwrap().total, 1);
+    assert_eq!(store.submission_count().await.unwrap(), 1);
 
     // the form itself survived, and so did the second delete's 404.
     assert_eq!(

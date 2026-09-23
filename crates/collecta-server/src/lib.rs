@@ -502,13 +502,8 @@ async fn list_grants(
 }
 
 async fn sync_status(State(state): State<AppState>) -> Result<Json<SyncStatusResponse>, ApiError> {
-    let counts = state.store.sync_counts().await?;
     Ok(Json(SyncStatusResponse {
-        pending: counts.pending,
-        synced: counts.synced,
-        failed: counts.failed,
-        abandoned: counts.abandoned,
-        total: counts.total,
+        submissions: state.store.submission_count().await?,
     }))
 }
 
@@ -657,9 +652,5 @@ struct GrantResponse {
 
 #[derive(Serialize)]
 struct SyncStatusResponse {
-    pending: usize,
-    synced: usize,
-    failed: usize,
-    abandoned: usize,
-    total: usize,
+    submissions: usize,
 }

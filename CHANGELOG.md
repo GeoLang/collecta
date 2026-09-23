@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs 142, it runs 160. docs/index.html said `SyncQueue` keeps submissions on
   disk; the type holds them in memory and serializes, and `collecta-cli` is what
   writes the file.
+- 2026-09-23: `GET /api/v1/sync/status` reports `{"submissions": <count>}`, the
+  submissions stored across the instance. It reported pending, synced, failed and
+  abandoned counts from a server-side `sync_queue` table where every submission
+  stayed pending, since nothing on the server ever advanced a row.
 - Docs page brought current (2026-08-14): attachments, tombstones, role
   enforcement and the OpenRosa layer were still listed as missing on
   docs/index.html after all four shipped. The README's ViewTopia row now says
@@ -131,6 +135,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Attachment storage on disk under `COLLECTA_DATA_DIR`, indexed by a new
   `attachments` table, with per-part and per-request size limits.
 - `COLLECTA_DATA_DIR` and `COLLECTA_BASE_URL` environment variables.
+
+### Removed
+- 2026-09-23: the server's `sync_queue` table and `Store::sync_counts` in
+  `crates/collecta-server/src/store.rs` (last sha 4adca82). Startup drops the table
+  from existing databases. The client `SyncQueue` in `collecta-core` is unchanged.
 
 ### Changed
 - `router()` now takes a `Config` instead of a bare JWT secret. The `/api/v1`

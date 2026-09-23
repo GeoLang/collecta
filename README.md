@@ -156,7 +156,7 @@ reaches Collect.
 | DELETE | `/api/v1/forms/{id}/grants/{user_id}` | Withdraw a grant | form creator, admin |
 | POST | `/api/v1/forms/{id}/publish` | Publish new submissions into Ptolemy | form creator, admin |
 | GET | `/api/v1/attachments/{id}` | Download an attachment's bytes | creator, grantee, admin |
-| GET | `/api/v1/sync/status` | Stored submissions across the instance, as `{"pending", "synced", "failed", "abandoned", "total"}`. The server files every one as `pending` | admin |
+| GET | `/api/v1/sync/status` | Stored submissions across the instance, as `{"submissions": <count>}` | admin |
 | POST | `/api/v1/sync/push` | Batch-upload queued submissions (idempotent) | editor, admin |
 | GET | `/api/v1/sync/forms?since=<cursor>` | Form definitions changed since cursor | any account |
 
@@ -425,7 +425,7 @@ leaves the file as it was.
 
 ## Persistence
 
-Server state is stored in SQLite (`forms`, `submissions`, `sync_queue`, `users`,
+Server state is stored in SQLite (`forms`, `submissions`, `users`,
 `attachments`, `form_grants`, `published_submissions` tables), so forms and submissions
 survive restarts.
 Attachment bytes live on disk under the data directory, and the table holds their

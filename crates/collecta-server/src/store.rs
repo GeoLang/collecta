@@ -1,4 +1,4 @@
-//! sqlite-backed persistence for forms, submissions, and the sync queue.
+//! sqlite-backed persistence for forms and submissions.
 //!
 //! Records are stored as their canonical json plus a few indexed columns.
 //! Pass `:memory:` as the path for an ephemeral database (tests); anything else
@@ -6,7 +6,6 @@
 
 use collecta_core::form::Form;
 use collecta_core::submission::{AttachmentRef, Submission};
-use collecta_core::sync_queue::{QueueItem, SyncStatus};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -17,16 +16,6 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
-}
-
-/// Sync-queue counts by status.
-#[derive(Default)]
-pub struct SyncCounts {
-    pub pending: usize,
-    pub synced: usize,
-    pub failed: usize,
-    pub abandoned: usize,
-    pub total: usize,
 }
 
 /// A stored attachment. `storage_path` is server-generated; no part of it comes
@@ -160,11 +149,8 @@ impl Store {
                 form_id TEXT NOT NULL,
                 data TEXT NOT NULL
             )",
-            "CREATE TABLE IF NOT EXISTS sync_queue (
-                submission_id TEXT PRIMARY KEY,
-                status TEXT NOT NULL,
-                data TEXT NOT NULL
-            )",
+            // upgraded databases still carry this table
+            "DROP TABLE IF EXISTS sync_queue",
             "CREATE TABLE IF NOT EXISTS users (
                 id TEXT PRIMARY KEY,
                 email TEXT NOT NULL UNIQUE,
@@ -407,8 +393,6 @@ impl Store {
         for statement in [
             "DELETE FROM attachments WHERE submission_id IN
                 (SELECT id FROM submissions WHERE form_id = ?)",
-            "DELETE FROM sync_queue WHERE submission_id IN
-                (SELECT id FROM submissions WHERE form_id = ?)",
             "DELETE FROM submissions WHERE form_id = ?",
             "DELETE FROM form_grants WHERE form_id = ?",
             "DELETE FROM published_submissions WHERE form_id = ?",
@@ -455,7 +439,6 @@ impl Store {
         }
         for statement in [
             "DELETE FROM attachments WHERE submission_id = ?",
-            "DELETE FROM sync_queue WHERE submission_id = ?",
             "DELETE FROM published_submissions WHERE submission_id = ?",
         ] {
             sqlx::query(statement)
@@ -528,8 +511,7 @@ impl Store {
         Ok(row.is_some())
     }
 
-    /// Persist a submission and enqueue it for sync. Returns false when that id
-    /// is already taken.
+    /// Persist a submission. Returns false when that id is already taken.
     ///
     /// A plain insert rather than a replace, and the constraint decides rather
     /// than a prior read: `id` comes from the client and is unique across every
@@ -543,35 +525,10 @@ impl Store {
             .execute(&self.pool)
             .await;
         match insert {
-            Ok(_) => {
-                self.enqueue(submission).await?;
-                Ok(true)
-            }
+            Ok(_) => Ok(true),
             Err(e) if is_unique_violation(&e) => Ok(false),
             Err(e) => Err(e),
         }
-    }
-
-    // every received submission enters the sync queue as pending, mirroring the
-    // offline-first client model and giving /sync/status persisted counts.
-    async fn enqueue(&self, submission: &Submission) -> Result<(), sqlx::Error> {
-        let item = QueueItem {
-            submission: submission.clone(),
-            status: SyncStatus::Pending,
-            retry_count: 0,
-            queued_at: chrono::Utc::now(),
-            last_attempt: None,
-            last_error: None,
-        };
-        sqlx::query(
-            "INSERT OR REPLACE INTO sync_queue (submission_id, status, data) VALUES (?, ?, ?)",
-        )
-        .bind(submission.id.to_string())
-        .bind(status_label(item.status))
-        .bind(encode_json(&item))
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 
     /// Insert a submission only if its id is new; returns whether it was
@@ -588,11 +545,7 @@ impl Store {
                 .bind(encode_json(submission))
                 .execute(&self.pool)
                 .await?;
-        let inserted = result.rows_affected() > 0;
-        if inserted {
-            self.enqueue(submission).await?;
-        }
-        Ok(inserted)
+        Ok(result.rows_affected() > 0)
     }
 
     /// Persist an openrosa submission under its `meta/instanceID`, or report the
@@ -619,10 +572,7 @@ impl Store {
         .await;
 
         match insert {
-            Ok(_) => {
-                self.enqueue(submission).await?;
-                Ok(InstanceInsert::Created(submission.id))
-            }
+            Ok(_) => Ok(InstanceInsert::Created(submission.id)),
             Err(e) if is_unique_violation(&e) => {
                 let existing = self
                     .find_instance(submission.form_id, instance_id)
@@ -870,24 +820,11 @@ impl Store {
         Ok(row.get::<i64, _>("n") as usize)
     }
 
-    pub async fn sync_counts(&self) -> Result<SyncCounts, sqlx::Error> {
-        let rows = sqlx::query("SELECT status, COUNT(*) AS n FROM sync_queue GROUP BY status")
-            .fetch_all(&self.pool)
+    pub async fn submission_count(&self) -> Result<usize, sqlx::Error> {
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM submissions")
+            .fetch_one(&self.pool)
             .await?;
-        let mut counts = SyncCounts::default();
-        for row in &rows {
-            let status: String = row.get("status");
-            let n = row.get::<i64, _>("n") as usize;
-            counts.total += n;
-            match status.as_str() {
-                "Pending" => counts.pending = n,
-                "Synced" => counts.synced = n,
-                "Failed" => counts.failed = n,
-                "Abandoned" => counts.abandoned = n,
-                _ => {}
-            }
-        }
-        Ok(counts)
+        Ok(row.get::<i64, _>("n") as usize)
     }
 }
 
@@ -914,16 +851,6 @@ fn format_cursor(row: &sqlx::sqlite::SqliteRow) -> String {
 fn is_unique_violation(e: &sqlx::Error) -> bool {
     e.as_database_error()
         .is_some_and(|db| db.is_unique_violation())
-}
-
-fn status_label(status: SyncStatus) -> &'static str {
-    match status {
-        SyncStatus::Pending => "Pending",
-        SyncStatus::InProgress => "InProgress",
-        SyncStatus::Synced => "Synced",
-        SyncStatus::Failed => "Failed",
-        SyncStatus::Abandoned => "Abandoned",
-    }
 }
 
 fn encode_json<T: Serialize>(value: &T) -> String {
