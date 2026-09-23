@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Collecta — Field Data Collection SDK</title>
+<title>Collecta: field data collection server</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--heading:#f0f6fc;--accent:#a78bfa;--accent2:#3fb950;--muted:#8b949e}
@@ -32,8 +32,8 @@ footer{padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
 <body>
 <header>
 <div class="container">
-<h1>📋 Collecta</h1>
-<p class="tagline">Schema-driven field data collection: form schemas, validation, JWT auth, and a sync protocol. Server and shared library, no field app yet.</p>
+<h1>Collecta</h1>
+<p class="tagline">A field data collection server and form library. It stores form schemas, validates submissions against them, serves ODK Collect over OpenRosa, and syncs with an offline command line client.</p>
 <div class="badges">
 <img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" alt="License">
 <img src="https://img.shields.io/badge/Rust-2024_edition-orange.svg" alt="Rust">
@@ -45,13 +45,13 @@ footer{padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
 <div class="container">
 <h2>Features</h2>
 <div class="grid">
-<div class="card"><h3>📝 Form Schemas</h3><p>20+ field types with validation constraints and XLSForm-compatible structure. A field hidden by its condition is skipped on validation, and expressions the model cannot hold are still carried into the XForm for ODK Collect to evaluate.</p></div>
-<div class="card"><h3>📡 Sync Protocol</h3><p>Idempotent submission push and cursor-based form pull. The <code>SyncQueue</code> type holds queued submissions in memory and schedules retries with exponential backoff. It serializes, so <code>collecta-cli</code> keeps it in a file between runs.</p></div>
-<div class="card"><h3>📎 Attachments</h3><p>Photo, audio, video, file, and signature parts arrive as multipart parts on the OpenRosa submission endpoint, are stored on disk, and download from <code>/api/v1/attachments/{id}</code>.</p></div>
-<div class="card"><h3>📱 OpenRosa</h3><p>formList, form.xml, and multipart submission endpoints with a Basic auth challenge, so ODK Collect works as the field client today.</p></div>
-<div class="card"><h3>🌍 GPS Field Types</h3><p>Point, trace, and shape geometry types in the form model, with latitude, longitude, altitude, and accuracy. Capture happens in the client.</p></div>
-<div class="card"><h3>✅ Validation</h3><p>Required fields, numeric range checks, text length, glob-style patterns, and OneOf sets. All errors are reported, not just the first.</p></div>
-<div class="card"><h3>🔌 REST API</h3><p>Axum server for form CRUD, XLSForm import, submission ingestion, and sync, persisted to SQLite. JWT auth with argon2id hashing.</p></div>
+<div class="card"><h3>Form Schemas</h3><p>21 field types with validation constraints, importable from XLSForm. A field hidden by its condition is skipped on validation, and expressions the model cannot hold are still carried into the XForm for ODK Collect to evaluate.</p></div>
+<div class="card"><h3>Sync Protocol</h3><p>Idempotent submission push and cursor-based form pull. The <code>SyncQueue</code> type holds queued submissions in memory and schedules retries with exponential backoff. It serializes, so <code>collecta-cli</code> keeps it in a file between runs.</p></div>
+<div class="card"><h3>Attachments</h3><p>Photo, audio, video, file and signature answers arrive as multipart parts on the OpenRosa submission endpoint, are stored on disk, and download from <code>/api/v1/attachments/{id}</code>. Anything that is not a capture format is served as <code>application/octet-stream</code>.</p></div>
+<div class="card"><h3>OpenRosa</h3><p>formList, form.xml, and multipart submission endpoints with a Basic auth challenge, so ODK Collect works as the field client today.</p></div>
+<div class="card"><h3>GPS Field Types</h3><p>Point, trace, and shape geometry types in the form model, with latitude, longitude, altitude, and accuracy. Capture happens in the client.</p></div>
+<div class="card"><h3>Validation</h3><p>Required fields, numeric range checks, text length, patterns with one leading or trailing <code>*</code>, and OneOf sets. All errors are reported, not just the first.</p></div>
+<div class="card"><h3>REST API</h3><p>Axum server for form CRUD, XLSForm import, submission ingestion, and sync, persisted to SQLite. JWT auth with argon2id hashing. Tagged releases publish <code>ghcr.io/geolang/collecta</code>.</p></div>
 </div>
 </div>
 </section>
@@ -59,7 +59,7 @@ footer{padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
 <section>
 <div class="container">
 <h2>Status</h2>
-<p>Collecta aims to be an open-source alternative to ArcGIS Field Maps, KoboToolbox, and ODK Collect. Today it is the server and the shared schema library, not the field app.</p>
+<p>The goal is an open-source alternative to ArcGIS Field Maps, KoboToolbox and ODK Collect. The repo holds the server, the shared schema library and a command line client, not a field app.</p>
 <table>
 <tr><th>Capability</th><th>Status</th></tr>
 <tr><td>Form schemas and validation</td><td>Working, repeat children included</td></tr>
@@ -73,7 +73,7 @@ footer{padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
 <tr><td>Mobile or desktop client</td><td>Not built, ODK Collect works against the OpenRosa endpoints</td></tr>
 <tr><td>Media attachment upload and download</td><td>Working, OpenRosa multipart upload to disk, authenticated download endpoint</td></tr>
 <tr><td>Deletes and tombstones in sync</td><td>Working, deleted forms surface as tombstones on the sync cursor</td></tr>
-<tr><td>Role-based authorization</td><td>Working, admin/editor/viewer enforced in middleware, unknown roles fail closed</td></tr>
+<tr><td>Role-based authorization</td><td>Working, admin/editor/viewer checked on every route, an unknown role is refused</td></tr>
 <tr><td>Per-form sharing</td><td>Working, a form's creator grants another account read on that form's submissions and attachments</td></tr>
 <tr><td>Ptolemy geodatabase integration</td><td>Working on demand, <code>POST /api/v1/forms/{id}/publish</code> commits a form's submissions there as versioned features, nothing publishes on its own</td></tr>
 </table>

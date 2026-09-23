@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/GeoLang/collecta/actions/workflows/ci.yml/badge.svg)](https://github.com/GeoLang/collecta/actions)
 
-**Schema-driven field data collection**: form schemas, validation, JWT auth, and a sync protocol for the GeoLang ecosystem.
+Collecta is a field data collection server and form library. It stores form schemas, validates submissions against them, serves ODK Collect over OpenRosa, and syncs with an offline command line client.
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
@@ -13,9 +13,9 @@
 
 ## Overview
 
-Collecta aims to be an open-source alternative to ArcGIS Field Maps, KoboToolbox, and
-ODK Collect. Today it is the server and the shared schema library, not the field app.
-It provides:
+The goal is an open-source alternative to ArcGIS Field Maps, KoboToolbox and ODK
+Collect. This repo holds the server, the shared schema library and a command line
+client, not a field app. It provides:
 
 - **Form schemas** with typed fields, conditional logic, and validation constraints
 - **GPS capture types** (point, trace, shape) in the form model
@@ -33,12 +33,12 @@ per-form grant checks, form CRUD including deletes, submission validation and in
 attachment download, XLSForm import, the push/pull sync endpoints, an OpenRosa
 compatibility layer that ODK Collect can submit to, publishing a form's submissions into
 a Ptolemy dataset, and the `collecta-cli` client that queues and pushes submissions and
-pulls form definitions. All are covered by tests (`cargo test` runs 160).
+pulls form definitions.
 
 **Not built yet:**
 
 - **No mobile or desktop app.** `collecta-cli` queues and pushes submissions from a
-  terminal, and ODK Collect is the supported app for filling forms in; there is no app
+  terminal, and ODK Collect is the supported app for filling forms in. There is no app
   or FFI layer of our own. The `AttachmentStore` type in `collecta-core` is there for a
   client author to use, and nothing in this repo uses it.
 - **Nothing renders a pulled form.** `collecta-cli pull` stores form definitions on the
@@ -75,7 +75,7 @@ pulls form definitions. All are covered by tests (`cargo test` runs 160).
 │  collecta-server (Axum REST API)                       │
 │  Form CRUD · Submission ingestion · Sync endpoints     │
 ├────────────────────────────────────────────────────────┤
-│  ptolemy (geodatabase) — spatial storage               │
+│  ptolemy (geodatabase): spatial storage                │
 │  One dataset per form · Submissions committed as       │
 │  versioned features by POST /forms/{id}/publish        │
 └────────────────────────────────────────────────────────┘
@@ -92,7 +92,7 @@ Ptolemy, which publishing writes to over its REST API.
 ### Form Schema
 
 - **21 field types**: Text, TextArea, Integer, Decimal, Date, DateTime, Time, Select, MultiSelect, GeoPoint, GeoTrace, GeoShape, Photo, Audio, Video, File, Barcode, Signature, Boolean, Repeat, Note
-- **Validation constraints**: Min/Max value, Min/Max length, glob-style pattern, OneOf
+- **Validation constraints**: Min/Max value, Min/Max length, Pattern, OneOf
 - **Conditional visibility**: a field carrying a `Condition` is validated only when the
   condition holds against the submission, so a hidden field is neither required nor
   constraint-checked. The XLSForm importer reads the six single-comparison `relevant`
@@ -109,9 +109,10 @@ A `collecta-core` type, driven by `collecta-cli` and serializable so a client ca
 in a file between runs.
 
 - **Queue submissions locally** so collection does not need connectivity
-- **Exponential backoff retry**: 5s → 10s → 20s → 40s → ... capped at 5min. A failed
-  item is left out of the push batch until its wait has passed.
-- **Max retries** with permanent failure status after threshold
+- **Exponential backoff retry**: 5 s after the first failure, doubling each time, capped
+  at 5 min. A failed item is left out of the push batch until its wait has passed.
+- **Max retries**: an item is marked Abandoned after 5 failures, or the count passed to
+  `SyncQueue::with_max_retries`
 - **Status tracking**: Pending, InProgress, Synced, Failed, Abandoned
 - Submissions only. Attachment sync is not implemented on either side.
 
@@ -120,7 +121,7 @@ in a file between runs.
 - Required field enforcement
 - Numeric range validation (min/max)
 - Text length validation
-- Pattern matching (glob-style)
+- Pattern matching: one leading or trailing `*` wildcard, otherwise an exact match
 - OneOf constraint (value must be from allowed set)
 - Unknown field detection
 - Full error reporting (all errors returned, not just first)
@@ -132,9 +133,9 @@ ODK resolves a reference inside a repeat. An instance key no child declares is a
 unknown field, as it is at the top level. A repeat never fails a required check,
 whether the submission carries an empty instance list or no key at all, because XForms
 scopes `required` to a question and Collect submits a repeat nobody added a row to.
-Defaults are not applied: a field's `default`
-is imported and stored, but nothing substitutes it on ingest and the XForm renderer
-emits empty instance nodes, so it never reaches Collect.
+Defaults are not applied: a field's `default` is imported and stored, but nothing
+substitutes it on ingest and the XForm renderer emits empty instance nodes, so it never
+reaches Collect.
 
 ### REST API
 
@@ -143,7 +144,7 @@ emits empty instance nodes, so it never reaches Collect.
 | GET | `/health` | Health check (public) | anyone |
 | POST | `/api/v1/auth/login` | Exchange email/password for a JWT (public) | anyone |
 | GET | `/api/v1/forms` | List all forms | any account |
-| POST | `/api/v1/forms` | Create a form (JSON) | editor, admin |
+| POST | `/api/v1/forms` | Create a form (JSON), or replace one by id | editor, admin. Replacing takes the form creator or an admin |
 | POST | `/api/v1/forms/import` | Import an XLSForm (`.xlsx` request body) | editor, admin |
 | GET | `/api/v1/forms/{id}` | Get form schema | any account |
 | DELETE | `/api/v1/forms/{id}` | Delete a form and everything collected under it | form creator, admin |
@@ -155,7 +156,7 @@ emits empty instance nodes, so it never reaches Collect.
 | DELETE | `/api/v1/forms/{id}/grants/{user_id}` | Withdraw a grant | form creator, admin |
 | POST | `/api/v1/forms/{id}/publish` | Publish new submissions into Ptolemy | form creator, admin |
 | GET | `/api/v1/attachments/{id}` | Download an attachment's bytes | creator, grantee, admin |
-| GET | `/api/v1/sync/status` | Count of submissions received (whole instance) | admin |
+| GET | `/api/v1/sync/status` | Stored submissions across the instance, as `{"pending", "synced", "failed", "abandoned", "total"}`. The server files every one as `pending` | admin |
 | POST | `/api/v1/sync/push` | Batch-upload queued submissions (idempotent) | editor, admin |
 | GET | `/api/v1/sync/forms?since=<cursor>` | Form definitions changed since cursor | any account |
 
@@ -208,10 +209,10 @@ answers 503.
 the form published so far.
 
 The caller's own bearer token is forwarded to Ptolemy, so collecta stores no credential
-there and can publish only what the caller could have written by hand. Both services take
-platform JWTs of the same shape, so one token works on both. A token Ptolemy refuses comes
-back as 403, and a Ptolemy that is unreachable or failing comes back as 502 naming its
-status.
+there and can publish only what the caller could have written by hand. This needs
+`COLLECTA_JWT_SECRET` to be the secret Ptolemy validates with, which is what the platform
+compose sets it to. A token Ptolemy refuses comes back as 403, and a Ptolemy that is
+unreachable or failing comes back as 502 naming its status.
 
 The first publish of a form creates the dataset (named after the form title, srid 4326),
 sets its attribute schema, creates its `main` branch, and records the dataset and branch
@@ -252,10 +253,10 @@ its server. Point Collect at the server URL and give it an account created with
 These routes use **HTTP Basic** against the same users table as the JSON API, since
 Collect has no concept of a bearer token. Give a collector the `editor` role: a `viewer`
 can download forms but gets a 403 on submit. A request without credentials gets a 401
-with `WWW-Authenticate: Basic realm="collecta"`, which is the challenge Collect waits
-for. **Run this behind TLS**: the OpenRosa auth spec forbids Basic over plain HTTP,
-and nothing here can enforce that for you. Every response carries
-`X-OpenRosa-Version: 1.0`; bodies are `OpenRosaResponse` envelopes.
+with `WWW-Authenticate: Basic realm="collecta", charset="UTF-8"`, which is the challenge
+Collect waits for. **Run this behind TLS**: the OpenRosa auth spec forbids Basic over
+plain HTTP, and nothing here enforces that. Every response carries
+`X-OpenRosa-Version: 1.0`, and bodies are `OpenRosaResponse` envelopes.
 
 Forms are generated from the stored form model. Field types map to XForm binds
 (`text`→`xsd:string`, `integer`→`xsd:int`, `geopoint`/`geotrace`/`geoshape`,
@@ -263,8 +264,8 @@ Forms are generated from the stored form model. Field types map to XForm binds
 with inline choices, repeats→repeat groups). The `relevant`, `constraint`, and
 `calculation` expressions the XLSForm importer preserved go into the binds, and
 **Collect evaluates them on the device**. A form built through the API carries no raw
-expression, so a field's `Condition` is rendered into the `relevant` attribute instead;
-where a field has both, the raw expression wins because it can say more. What the
+expression, so a field's `Condition` is rendered into the `relevant` attribute instead.
+Where a field has both, the raw expression wins because it can say more. What the
 server enforces on ingest is what its own validation engine models: the constraints,
 plus the `relevant` condition where one was modelled.
 
@@ -294,11 +295,11 @@ several POSTs, repeating the identical instance XML each time, so:
 - the same instanceID under a different form is an independent submission.
 
 Attachments are written to `<data dir>/attachments/<submission uuid>/<attachment
-uuid>`. Both path components are server-generated UUIDs; the client's file name is
+uuid>`. Both path components are server-generated UUIDs. The client's file name is
 recorded as metadata only and never becomes a path component. The part's content type is
 narrowed to a capture format or to `application/octet-stream` on the way in, so the
-recorded type is always one collecta chose. Parts are capped at 50 MB each (the advertised
-`X-OpenRosa-Accept-Content-Length`) with a slightly larger whole-request cap; oversized
+recorded type is always one collecta chose. Parts are capped at 50 MiB each (the advertised
+`X-OpenRosa-Accept-Content-Length`) with a whole-request cap 1 MiB above that. Oversized
 requests get 413.
 
 **Not supported:** form manifests and external media (`manifestUrl` is not emitted),
@@ -310,9 +311,9 @@ rendered as an XForm and is omitted from `/formList`.
 
 ## Authentication and roles
 
-Users are admin-seeded, there is no signup endpoint. Passwords are hashed with
-argon2id, tokens are HS256 JWTs (claims `sub`/`exp`/`role`, 24h expiry, same
-conventions as tiletopia-server).
+Users are seeded with `create-user`. There is no signup endpoint. Passwords are hashed
+with argon2id, and tokens are HS256 JWTs signed with `COLLECTA_JWT_SECRET`, with claims
+`sub`, `exp` and `role` and a 24 hour expiry. `sub` has to be a UUID.
 
 Every account has one of three roles, and the same roles apply over the OpenRosa
 routes:
@@ -402,8 +403,11 @@ cargo run -p collecta-cli -- pull --server http://localhost:3000 --token "$TOKEN
 ```
 
 The queue file is `./collecta-queue.json`, overridable with `$COLLECTA_QUEUE` or
-`--queue <path>`. The bearer token comes from `--token` or `$COLLECTA_TOKEN`; the push
+`--queue <path>`. The bearer token comes from `--token` or `$COLLECTA_TOKEN`. The push
 endpoint requires one and files every item under that account.
+
+A pushed `v*` tag attaches `collecta-cli` builds for x86_64 and aarch64 Linux and macOS
+to the GitHub release.
 
 A push sends the items that are due and applies the per-item result: `accepted` and
 `duplicate` mark an item synced, `error` marks it failed and shows the server's message.
@@ -430,27 +434,28 @@ tombstone and what hides it from every read path.
 
 Environment variables:
 
-- `COLLECTA_DB` — database path (default `./collecta.db`; `:memory:` for ephemeral)
-- `COLLECTA_ADDR` — listen address (default `0.0.0.0:3000`)
-- `COLLECTA_JWT_SECRET` — JWT signing secret, required, at least 32 bytes
-  (e.g. `openssl rand -hex 32`); the server refuses to start without it, and an
-  empty value counts as unset
-- `COLLECTA_DATA_DIR` — root for attachment blobs (default `./collecta-data`)
-- `COLLECTA_BASE_URL` — absolute origin advertised in OpenRosa `downloadUrl`s
-  (e.g. `https://collect.example.org`). Unset, it is derived from each request's
-  `Host`, which is fine directly on the internet but wrong behind a proxy that
-  rewrites it. Also the origin of the attachment URLs a published feature carries,
-  where it is the only source: unset, those URLs are the route alone
-- `COLLECTA_PTOLEMY_URL` — root Ptolemy is served at (e.g. `http://ptolemy:8000`).
-  Unset, `POST /api/v1/forms/{id}/publish` answers 503
+- `COLLECTA_DB`: database path, default `./collecta.db`. `:memory:` keeps nothing
+  on disk
+- `COLLECTA_ADDR`: listen address, default `0.0.0.0:3000`
+- `COLLECTA_JWT_SECRET`: JWT signing secret, required, at least 32 bytes
+  (`openssl rand -hex 32`). The server refuses to start without it, and an empty
+  value counts as unset
+- `COLLECTA_DATA_DIR`: root for attachment files, default `./collecta-data`
+- `COLLECTA_BASE_URL`: absolute origin advertised in OpenRosa `downloadUrl`s, for
+  example `https://collect.example.org`. Unset, it is derived from each request's
+  `Host`, which is wrong behind a proxy that rewrites `Host`. It is also the only
+  source for the origin of the attachment URLs a published feature carries. Unset,
+  those URLs are the route alone
+- `COLLECTA_PTOLEMY_URL`: root Ptolemy is served at, for example
+  `http://ptolemy:3000`. Unset, `POST /api/v1/forms/{id}/publish` answers 503
 
 ---
 
 ## XLSForm Import
 
 `POST /api/v1/forms/import` accepts an [XLSForm](https://xlsform.org) `.xlsx`
-(raw body) and registers the parsed form. The engine models a subset of XLSForm;
-the importer maps what it can and preserves the rest rather than dropping it.
+(raw body) and registers the parsed form. The engine models a subset of XLSForm. The
+importer maps what it can and keeps the rest as metadata.
 
 **Supported types** (`survey.type`): `text`/`string`, `integer`/`int`, `decimal`,
 `date`, `time`, `dateTime`/`datetime`, `note`, `geopoint`, `geotrace`, `geoshape`,
@@ -460,13 +465,13 @@ the importer maps what it can and preserves the rest rather than dropping it.
 
 **Mapping notes:**
 
-- `choices` and `settings` (`form_title`, `version`) sheets are read; sheet names
+- `choices` and `settings` (`form_title`, `version`) sheets are read. Sheet names
   are matched case-insensitively.
 - `required` (`yes`/`true`/`1`) maps to the field's required flag.
 - `select_one` attaches its choice list and a `OneOf` constraint the validation
   engine enforces. `select_multiple` attaches choices but membership is not enforced
   (the engine does not validate multi-choice values).
-- `begin_group`/`end_group` is flattened (the model has no group container); each
+- `begin_group`/`end_group` is flattened, since the model has no group container. Each
   inner field keeps its group name under `metadata.group`. `begin_repeat` maps to a
   `Repeat` field with nested children.
 
@@ -483,23 +488,18 @@ expression is kept here, the modelled ones included, so the XForm bind still car
 what the author wrote. Constraint and calculation expressions are carried through
 rather than enforced.
 
-**Unsupported:** computed/logic types such as `calculate`, `rank`, and `range` are
-rejected with an error rather than silently coerced.
+**Unsupported:** any other type, `calculate`, `rank` and `range` included, fails the
+import with a 422 naming the row.
 
 ---
 
 ## Quick Start
 
 ```bash
-# Build
 git clone https://github.com/GeoLang/collecta.git
-cd collecta && cargo build --release
-
-# Run tests
+cd collecta
 cargo test
-
-# Start server
-cargo run -p collecta-server
+COLLECTA_JWT_SECRET=$(openssl rand -hex 32) cargo run -p collecta-server
 ```
 
 ### Container
@@ -507,38 +507,30 @@ cargo run -p collecta-server
 The `Dockerfile` builds `collecta-server` and runs it as a non-root user on port
 3000, with the sqlite database and the attachment files under `/data`, so mount a
 volume there. `COLLECTA_JWT_SECRET` still has to be supplied. The image declares a
-healthcheck against `/health`. Viewtopia's platform compose builds this image and
-serves it behind an nginx `/collecta/` route, where `COLLECTA_BASE_URL` has to be the
-public prefix rather than the container address.
+healthcheck against `/health`. A pushed `v*` tag publishes it as
+`ghcr.io/geolang/collecta:<tag>` and `ghcr.io/geolang/collecta:latest`. Viewtopia's
+platform compose builds this image and serves it behind an nginx `/collecta/` route,
+where `COLLECTA_BASE_URL` has to be the public prefix rather than the container
+address.
 
 ### Create a Form
 
 ```bash
 curl -X POST http://localhost:3000/api/v1/forms \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "id": "550e8400-e29b-41d4-a716-446655440000",
     "title": "Site Inspection",
     "version": 1,
     "fields": [
-      {"name": "site_name", "label": "Site Name", "field_type": "Text", "required": true, "constraints": [], "hint": null, "default": null, "relevant": null, "choices": null, "children": null},
-      {"name": "location", "label": "GPS Location", "field_type": "GeoPoint", "required": true, "constraints": [], "hint": null, "default": null, "relevant": null, "choices": null, "children": null},
-      {"name": "condition", "label": "Condition", "field_type": "Select", "required": true, "constraints": [], "hint": null, "default": null, "relevant": null, "choices": [{"value": "good", "label": "Good"}, {"value": "fair", "label": "Fair"}, {"value": "poor", "label": "Poor"}], "children": null},
-      {"name": "photo", "label": "Site Photo", "field_type": "Photo", "required": false, "constraints": [], "hint": "Take a photo of the site", "default": null, "relevant": null, "choices": null, "children": null}
+      {"name": "site_name", "label": "Site Name", "field_type": "Text", "required": true, "constraints": []},
+      {"name": "location", "label": "GPS Location", "field_type": "GeoPoint", "required": true, "constraints": []},
+      {"name": "condition", "label": "Condition", "field_type": "Select", "required": true, "constraints": [], "choices": [{"value": "good", "label": "Good"}, {"value": "fair", "label": "Fair"}, {"value": "poor", "label": "Poor"}]},
+      {"name": "photo", "label": "Site Photo", "field_type": "Photo", "required": false, "constraints": [], "hint": "Take a photo of the site"}
     ]
   }'
 ```
-
----
-
-## Target Use Cases
-
-- **Utility inspections** — pole/pipe condition surveys with GPS and photos
-- **Environmental monitoring** — water quality sampling, species observations
-- **Construction** — daily reports, safety checklists, progress photos
-- **Agriculture** — crop health surveys, soil sampling, pest reports
-- **Humanitarian** — needs assessments, health surveys, damage reports
-- **Property** — building inspections, property valuations, compliance audits
 
 ---
 
@@ -548,7 +540,7 @@ curl -X POST http://localhost:3000/api/v1/forms \
 |---------|-------------|
 | [TerraVista](https://github.com/GeoLang/terravista) | Map engine core for a future field app |
 | [Ptolemy](https://github.com/GeoLang/ptolemy) | `POST /api/v1/forms/{id}/publish` commits a form's submissions there as versioned features |
-| [ViewTopia](https://github.com/GeoLang/viewtopia) | Field Data panel lists forms and loads submissions as a map layer |
+| [ViewTopia](https://github.com/GeoLang/viewtopia) | Field Data panel lists forms, loads submissions as a map layer and publishes a form to Ptolemy |
 
 ---
 
