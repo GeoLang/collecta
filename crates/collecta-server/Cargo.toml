@@ -33,4 +33,4 @@ reqwest = { version = "0.13", default-features = false, features = [
 jsonwebtoken = "9"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
-rust_xlsxwriter = "0.96"
+rust_xlsxwriter = "0.99"
