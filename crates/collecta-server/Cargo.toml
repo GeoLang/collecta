@@ -19,7 +19,7 @@ jsonwebtoken = "9"
 argon2 = { version = "0.5", features = ["std"] }
 # openrosa: xml read/write, basic-auth decode, protocol-mandated form hash.
 # quick-xml and base64 versions match what calamine/jsonwebtoken already lock.
-quick-xml = "0.41"
+quick-xml = "0.42"
 base64 = "0.22"
 md-5 = "0.11"
 sha2 = "0.10"
