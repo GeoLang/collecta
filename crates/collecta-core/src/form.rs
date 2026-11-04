@@ -281,7 +281,7 @@ pub enum ConstraintKind {
     MinLength(usize),
     /// Maximum text length.
     MaxLength(usize),
-    /// Regex pattern match.
+    /// Text match with one leading or trailing `*` wildcard, otherwise an exact match.
     Pattern(String),
     /// Value must be in a set.
     OneOf(Vec<String>),
