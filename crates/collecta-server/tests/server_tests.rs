@@ -143,6 +143,179 @@ async fn data_endpoints_require_valid_token() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+fn live_expiry() -> i64 {
+    (chrono::Utc::now() + chrono::Duration::hours(2)).timestamp()
+}
+
+fn signed_claims(claims: &serde_json::Value) -> String {
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        claims,
+        &jsonwebtoken::EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_role_token_carrying_a_scope_marker_is_refused() {
+    let (app, _token) = test_app().await;
+
+    let unmarked = signed_claims(&serde_json::json!({
+        "sub": Uuid::new_v4(), "exp": live_expiry(), "role": "admin", "team": "survey"
+    }));
+    let resp = app
+        .clone()
+        .oneshot(get("/api/v1/forms", &unmarked))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    for marker in ["token_use", "agora_use", "geolang_use"] {
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!("tool"),
+            serde_json::json!("feed"),
+            serde_json::json!("mcp"),
+            serde_json::json!(1),
+        ] {
+            let token = signed_claims(&serde_json::json!({
+                "sub": Uuid::new_v4(), "exp": live_expiry(), "role": "admin", marker: value
+            }));
+            let resp = app
+                .clone()
+                .oneshot(get("/api/v1/forms", &token))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{marker}: {value}");
+        }
+    }
+
+    let tool_token = signed_claims(&serde_json::json!({
+        "sub": Uuid::new_v4(), "exp": live_expiry(), "token_use": "tool", "scope": ["collecta:read"]
+    }));
+    let resp = app
+        .clone()
+        .oneshot(get("/api/v1/forms", &tool_token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_token_carrying_aud_is_refused() {
+    let (app, _token) = test_app().await;
+
+    for aud in [
+        serde_json::json!("collecta"),
+        serde_json::json!(["collecta"]),
+        serde_json::json!(7),
+        serde_json::json!({"service": "collecta"}),
+        serde_json::json!(null),
+    ] {
+        let token = signed_claims(&serde_json::json!({
+            "sub": Uuid::new_v4(), "exp": live_expiry(), "role": "admin", "aud": aud
+        }));
+        let resp = app
+            .clone()
+            .oneshot(get("/api/v1/forms", &token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{aud}");
+    }
+}
+
+#[tokio::test]
+async fn a_blank_secret_refuses_the_tokens_its_own_login_signs() {
+    let app = router(
+        seeded_store(":memory:").await,
+        Config::new(
+            " ".repeat(32),
+            std::env::temp_dir().join("collecta-tests-unused"),
+        ),
+    );
+
+    let token = login(&app, TEST_EMAIL, TEST_PASSWORD).await;
+
+    let resp = app.oneshot(get("/api/v1/forms", &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_valid_platform_token_acts_as_its_subject() {
+    let (app, store) = authz_app().await;
+    let subject = Uuid::new_v4();
+    let editor = signed_claims(&serde_json::json!({
+        "sub": subject, "exp": live_expiry(), "role": "editor", "name": "Ada"
+    }));
+
+    let form = one_field_form("Site");
+    assert_eq!(create_form(&app, &editor, &form).await, StatusCode::CREATED);
+    assert_eq!(
+        store.form_owner(form.id).await.unwrap(),
+        Some(FormOwner::User(subject))
+    );
+
+    for role in ["admin", "editor", "viewer"] {
+        let token = signed_claims(&serde_json::json!({
+            "sub": Uuid::new_v4(), "exp": live_expiry(), "role": role
+        }));
+        let resp = app
+            .clone()
+            .oneshot(get("/api/v1/forms", &token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{role}");
+    }
+}
+
+#[tokio::test]
+async fn a_token_without_a_uuid_subject_or_a_known_role_is_refused() {
+    let (app, _token) = test_app().await;
+    let subject = Uuid::new_v4();
+    let exp = live_expiry();
+
+    for (case, claims, status) in [
+        (
+            "subject is not a uuid",
+            serde_json::json!({"sub": "user-1", "exp": exp, "role": "admin"}),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "no role",
+            serde_json::json!({"sub": subject, "exp": exp}),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "null role",
+            serde_json::json!({"sub": subject, "exp": exp, "role": null}),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "non-string role",
+            serde_json::json!({"sub": subject, "exp": exp, "role": 7}),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "non-string name",
+            serde_json::json!({"sub": subject, "exp": exp, "role": "admin", "name": 7}),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "unknown role",
+            serde_json::json!({"sub": subject, "exp": exp, "role": "collector"}),
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let token = signed_claims(&claims);
+        let resp = app
+            .clone()
+            .oneshot(get("/api/v1/forms", &token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), status, "{case}");
+    }
+}
+
 #[tokio::test]
 async fn submissions_survive_restart() {
     let dir = tempfile::tempdir().unwrap();

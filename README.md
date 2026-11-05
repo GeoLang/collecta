@@ -315,6 +315,12 @@ Users are seeded with `create-user`. There is no signup endpoint. Passwords are 
 with argon2id, and tokens are HS256 JWTs signed with `COLLECTA_JWT_SECRET`, with claims
 `sub`, `exp` and `role` and a 24 hour expiry. `sub` has to be a UUID.
 
+The shared `platform-auth` crate checks each token. A token carrying `aud`, `token_use`,
+`agora_use` or `geolang_use` gets 401, even with a null value, and so does a tool token. A
+`COLLECTA_JWT_SECRET` of only whitespace refuses every token, including the ones the login
+route signs with it. The OpenRosa routes use Basic credentials, so none of this applies to
+them.
+
 Every account has one of three roles, and the same roles apply over the OpenRosa
 routes:
 

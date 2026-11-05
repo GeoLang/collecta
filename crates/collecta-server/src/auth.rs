@@ -17,7 +17,8 @@ use axum::middleware::Next;
 use axum::response::{Json, Response};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use jsonwebtoken::{EncodingKey, Header, encode};
+use platform_auth::{TokenAuthority, bearer_token, verify_token};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -26,11 +27,8 @@ use crate::store::UserRecord;
 
 pub const TOKEN_TTL_HOURS: i64 = 24;
 
-/// Scheme prefix of the `Authorization` header the JSON API takes.
-pub const BEARER_PREFIX: &str = "Bearer ";
-
 /// JWT claims (same shape as tiletopia's).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Claims {
     pub sub: String,
     pub exp: usize,
@@ -127,24 +125,6 @@ pub fn create_jwt(user: &UserRecord, secret: &str) -> Result<String, jsonwebtoke
     )
 }
 
-fn extract_claims(request: &Request, secret: &str) -> Result<Claims, StatusCode> {
-    let auth_header = request
-        .headers()
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-    let token = auth_header
-        .strip_prefix(BEARER_PREFIX)
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-    decode::<Claims>(
-        token,
-        &DecodingKey::from_secret(secret.as_bytes()),
-        &Validation::default(),
-    )
-    .map(|data| data.claims)
-    .map_err(|_| StatusCode::UNAUTHORIZED)
-}
-
 /// Middleware guarding all data endpoints: rejects requests without a valid
 /// bearer token and exposes the [`Caller`] to handlers via request extensions.
 ///
@@ -156,10 +136,14 @@ pub async fn require_auth(
     mut request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let claims = extract_claims(&request, &state.jwt_secret)?;
+    let token = bearer_token(request.headers()).ok_or(StatusCode::UNAUTHORIZED)?;
+    let verified = verify_token(token, &state.jwt_secret).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let TokenAuthority::Platform { role: Some(role) } = verified.authority else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
     // a sub that is not a user id cannot be a token this server minted.
-    let id: Uuid = claims.sub.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let role = Role::parse(&claims.role).ok_or(StatusCode::FORBIDDEN)?;
+    let id: Uuid = verified.sub.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let role = Role::parse(&role).ok_or(StatusCode::FORBIDDEN)?;
     request.extensions_mut().insert(Caller { id, role });
     Ok(next.run(request).await)
 }

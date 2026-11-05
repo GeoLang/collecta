@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use axum::Extension;
 use axum::extract::{Path, State};
-use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use serde::Serialize;
@@ -23,7 +22,7 @@ use uuid::Uuid;
 use collecta_core::form::{FieldType, Form, FormField};
 use collecta_core::submission::{FieldValue, GeoPoint, Submission};
 
-use crate::auth::{BEARER_PREFIX, Caller};
+use crate::auth::Caller;
 use crate::store::PublishTarget;
 use crate::{ApiError, AppState, require_owner};
 
@@ -86,7 +85,13 @@ pub async fn publish(
             format!("{PTOLEMY_URL_VARIABLE} is not set, so there is no ptolemy to publish to"),
         )
     })?;
-    let token = bearer_token(&headers)?;
+    let token = platform_auth::bearer_token(&headers).ok_or_else(|| {
+        PublishError(
+            StatusCode::UNAUTHORIZED,
+            "publishing forwards the caller's bearer token, and this request carries none"
+                .to_string(),
+        )
+    })?;
     let form = state
         .store
         .get_form(form_id)
@@ -150,20 +155,6 @@ pub struct PublishResponse {
 fn commit_message(title: &str, count: usize) -> String {
     let plural = if count == 1 { "" } else { "s" };
     format!("collecta: {count} submission{plural} of {title}")
-}
-
-fn bearer_token(headers: &HeaderMap) -> Result<&str, PublishError> {
-    headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix(BEARER_PREFIX))
-        .ok_or_else(|| {
-            PublishError(
-                StatusCode::UNAUTHORIZED,
-                "publishing forwards the caller's bearer token, and this request carries none"
-                    .to_string(),
-            )
-        })
 }
 
 /// A thin ptolemy client holding the caller's token for the length of one publish.

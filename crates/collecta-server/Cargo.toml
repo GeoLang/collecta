@@ -15,7 +15,9 @@ tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite"] }
-jsonwebtoken = "9"
+platform-auth = { git = "https://github.com/GeoLang/platform-crates.git", branch = "master" }
+# aws_lc_rs, not rust_crypto: rust_crypto pulls rsa 0.9 (RUSTSEC-2023-0071)
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 argon2 = { version = "0.5", features = ["std"] }
 # openrosa: xml read/write, basic-auth decode, protocol-mandated form hash.
 # quick-xml and base64 versions match what calamine/jsonwebtoken already lock.
@@ -30,7 +32,6 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-jsonwebtoken = "9"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 rust_xlsxwriter = "0.96"

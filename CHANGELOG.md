@@ -142,6 +142,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from existing databases. The client `SyncQueue` in `collecta-core` is unchanged.
 
 ### Changed
+- 2026-11-04: CI and the release workflow call the reusable workflows in
+  `GeoLang/.github`. The `collecta-<target>.tar.gz` archives and the image tags
+  are unchanged.
 - `router()` now takes a `Config` instead of a bare JWT secret. The `/api/v1`
   routes themselves are unchanged.
 - `Store::insert_form` takes a `FormWriter` and returns whether the write was
@@ -150,6 +153,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   meaning that id was already taken.
 
 ### Security
+- 2026-11-05: `require_auth` checks bearer tokens with `platform_auth::verify_token`
+  instead of a local decode. `COLLECTA_JWT_SECRET` is the platform secret in the
+  compose stack, so a token scoped to another service reached this server. A token
+  with a `role` and a `token_use`, `agora_use` or `geolang_use` claim, null values
+  included, used to pass and now gets 401. So does a token with a non-string `aud`
+  or `name`, and a token signed with a secret of only whitespace. The UUID `sub`,
+  the role names and the OpenRosa Basic routes are unchanged. `jsonwebtoken` moves
+  from 9 to 11 on `aws_lc_rs`. `auth::BEARER_PREFIX` is deleted.
 - The JSON API records who filed a submission (2026-08-11). `POST
   /api/v1/forms/{id}/submissions` and `POST /api/v1/sync/push` stored the
   `collector_id` from the request body, so submissions arrived with no submitter
